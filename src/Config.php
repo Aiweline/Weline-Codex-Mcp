@@ -238,10 +238,11 @@ final class Config
                 'max_files' => 20,
                 'max_file_bytes' => 1_048_576,
                 'max_total_bytes' => 4_194_304,
-                'allowed_roots' => ['app/code', 'dev/ai/mcp'],
+                'allowed_roots' => ['app/code', 'dev/ai/mcp', 'dev/ai/codex/tasks'],
                 'denied_paths' => [
                     '.git/**', '.codex/**', '.agents/**', '.gitnexus/**', 'vendor/**', '**/vendor/**',
                     'generated/**', 'var/**', 'pub/static/**', 'pub/media/**', '**/view/tpl/**',
+                    'dev/ai/codex/tasks/**/artifacts/**',
                     '**/.env', '**/.env.*', '**/auth.json', '**/*.pem', '**/*.key', 'app/etc/env.php',
                 ],
             ],

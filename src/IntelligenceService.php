@@ -411,9 +411,30 @@ final class IntelligenceService
                 'confidence' => $item['confidence'] ?? 0,
             ], $learning);
             $bundle['routing'] = [
-                'next' => 'Return only replacements for these guarded regions; use apply_compact_edit once to write, validate, and reindex locally.',
+                'phase' => $paths === [] ? 'discovery' : 'materialization',
+                'batch_request' => [
+                    'phase' => $paths === [] ? 'discovery' : 'materialization',
+                    'requested_path_count' => count($paths),
+                    'requested_symbol_count' => count(self::strings($input['symbols'] ?? [])),
+                    'requested_target_count' => count($paths) + count(self::strings($input['symbols'] ?? [])),
+                    'multi_path_batch' => count($paths) > 1,
+                    'single_file_round_trip' => count($paths) === 1
+                        && count(self::strings($input['symbols'] ?? [])) <= 1,
+                ],
+                'architecture_first' => true,
+                'context_policy' => 'Reason over all accumulated bundles before editing; do not treat one bounded response as automatically complete.',
+                'next' => 'First decide whether the owning architecture, definitions, callers, configuration, rules, docs, and complete modification set are known. If not, collect every missing path, symbol, and semantic search goal and request another broad get_edit_bundle batch. If yes, emit one complete edit-plan.v1 and call apply_compact_edit once.',
+                'batch_followup_allowed' => true,
+                'followup_request' => [
+                    'collect_paths' => true,
+                    'collect_symbols' => true,
+                    'collect_search_goals' => true,
+                    'single_file_round_trips' => false,
+                ],
                 'scan_required' => false,
                 'whole_file_read_required' => false,
+                'native_single_file_read_allowed' => false,
+                'write_contract' => 'Exactly one apply_compact_edit call after accumulated context is sufficient.',
             ];
 
             return $bundle;

@@ -10,6 +10,7 @@
 - Codex 生命周期 Hook Collector。
 - 个人 Codex 插件启动层：自动注册 PHP MCP 与 7 个 Hook，并使用 Codex 持久化 Hook Hash trust，无需手编 TOML/Hook JSON。
 - `SessionStart` 自动解析当前 Git 项目、注入有界路由元数据，并在响应后后台首建/增量刷新该项目独立索引。
+- AI-facing 工具说明、插件默认 Prompt、SessionStart、UserPromptSubmit 与 bundle routing 使用同一架构优先宽批次协议：发现未知架构、批量物化候选、按累计上下文成批补齐，最终只进行一次事务写入。
 - 每个成功或失败的 MCP `tools/call` 都返回服务端 `_weline_mcp` 使用回执，并要求本轮真实调用后的用户汇报以 `Weline：` 开头；仅启动/初始化不冒充使用。
 - SQLite/WAL/FTS5 Schema、事务 Migration 和同步 Trigger。
 - Project/Session/Event/Evidence/Experience/Version/Feedback/Contradiction/Proposal/Job/Audit 数据链。

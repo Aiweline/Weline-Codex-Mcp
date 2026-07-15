@@ -8,10 +8,11 @@
 
 Weline MCP is a local-first project intelligence, transactional editing, and evidence-backed learning engine for Codex.
 
-1. Call `get_edit_bundle` once with the task, all known paths, and affected symbols.
-2. It refreshes explicit paths, checks hashes, and returns only bounded code regions, related files, impacts, docs, rules, and Skills within the token budget.
-3. Codex submits one `edit-plan.v1`.
-4. `apply_compact_edit` locks targets, rechecks hashes, prepares non-overlapping changes, commits atomically, validates, reindexes, and rolls back safely when needed.
+1. When the owning architecture or call chain is unknown, call `get_edit_bundle` as a discovery batch with the full task and relevant symbols/module/kinds, omitting paths only to discover unknown related files.
+2. Once candidates are known, submit every relevant path and affected symbol in one materialization batch; MCP refreshes explicit paths and returns bounded regions, impacts, docs, rules, and Skills.
+3. After each bundle, reason over accumulated context. If it is incomplete, collect all missing paths, symbols, and semantic search goals, then request another broad batch instead of reading files one by one.
+4. Once context is sufficient, Codex submits one complete `edit-plan.v1`.
+5. `apply_compact_edit` locks targets, rechecks hashes, prepares non-overlapping changes, commits atomically, validates, reindexes, and rolls back safely when needed.
 
 The normal runtime needs PHP 8.2+, SQLite extensions, and Git. Composer and Node.js are optional distribution surfaces. The npm package is a dependency-free process wrapper; the same PHP STDIO server owns the protocol and data.
 
@@ -122,7 +123,7 @@ The default config is `~/.learning-mcp/config.yaml`; Windows uses `%USERPROFILE%
 ## Recommended agent workflow
 
 ```markdown
-- Call get_edit_bundle once with the task, all known paths, and affected symbols.
+- Use get_edit_bundle first for architecture discovery when targets are unknown, then submit all known paths and affected symbols in broad materialization batches; request another batch only when accumulated context is insufficient.
 - Use returned regions, hashes, impacts, docs, and Skills instead of repository-wide scans.
 - Submit one edit-plan.v1 and call apply_compact_edit once.
 - Use get_edit_status and rollback_edit for recovery only.

@@ -47,7 +47,7 @@
 5. 只有 size/mtime/hash 变化的文件进入 Parser；删除项从 SQLite cascade 清理。
 6. PHP/PHTML 由 `token_get_all` 解析结构；Markdown 由 Heading 分块；其他文本按有界行块处理。
 7. 同一写事务更新 `indexed_files/indexed_file_contents/chunks/symbols/relations/skills`、unicode FTS、trigram FTS 和稀疏 Feature Hash。
-8. `get_edit_bundle` 对全部显式 `paths[]` 先做内容 Hash 定点刷新，再由 `ProjectRetriever` 执行一次 scoped chunk SQL 并在本地排序；无路径时才合并 exact/BM25/trigram/sparse-dot。多符号上游影响以 definitions + 最多三次合并 relation SQL 计算，不再 N 次 `inspectSymbol`。
+8. AI-facing 路由把现有两种检索模式组织成架构优先的宽批次：所属架构或调用链未知时，不传路径围栏，由 `ProjectRetriever` 合并 exact/BM25/trigram/sparse-dot 做发现；候选明确后，把全部显式 `paths[]` 和符号一次提交，先做内容 Hash 定点刷新，再执行一次 scoped chunk SQL 并在本地排序。模型在每轮后判断累计上下文，不足时汇总一批缺失路径/符号/语义目标继续补齐，禁止逐文件读取。多符号上游影响以 definitions + 最多三次合并 relation SQL 计算，不再 N 次 `inspectSymbol`。
 9. `apply_compact_edit` 先解析全部 project-relative target path，按字典序获取项目内的跨进程文件锁；相同文件的其他会话进入 `flock` 等待队列，多文件计划因固定顺序不会互相死锁。锁内先定点刷新所有目标并记录 submitted/locked/refreshed revision，再让 `EditService::prepare` 封存 Draft，由 `apply` 复核 HEAD/read-set、写 Journal 并原子替换；一次性 Token 不返回模型。
 10. 文件整体 Hash 已变化时，只允许唯一文本锚点或带 digest 的 symbol/section/range 安全重定位；目标漂移则再次定点刷新索引，把 `metadata.task` 与旧锚点用于检索最新版区域，并返回 `EDIT_REPLAN_REQUIRED + latest_regions + original_task + retry_contract`。固定验证、必要回滚、最终态定点索引和知识协调都在文件锁内完成，所有成功/失败路径随后立即释放；进程异常退出时内核自动释放 `flock`。
 11. `KnowledgeService` 根据 module code/docs digest 和确定性符号事实报告漂移，并生成 `doc/ai` 派生文件的 Edit Plan。

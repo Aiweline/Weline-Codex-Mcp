@@ -155,7 +155,9 @@ editing:
   allowed_roots:
     - app/code
     - dev/ai/mcp
+    - dev/ai/codex/tasks
   denied_paths:
+    - dev/ai/codex/tasks/**/artifacts/**
     - .git/**
     - .codex/**
     - .agents/**

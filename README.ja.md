@@ -8,10 +8,11 @@
 
 Weline MCP は Codex 向けのローカル優先プロジェクトインテリジェンス、トランザクション編集、証拠ベース学習エンジンです。
 
-1. タスク、既知パス、影響シンボルを `get_edit_bundle` に一度だけ渡します。
-2. 明示パスと Hash を更新確認し、Token Budget 内で必要なコード領域、関連ファイル、影響、文書、ルール、Skill だけを返します。
-3. Codex は 1 つの `edit-plan.v1` を送ります。
-4. `apply_compact_edit` がロック、Hash 再確認、原子的コミット、検証、再インデックス、安全なロールバックを行います。
+1. 所属アーキテクチャや呼び出し経路が不明な場合、完全なタスクと関連する symbol/module/kind を使って `get_edit_bundle` の発見バッチを実行し、未知の関連ファイルを探す場合だけ paths を省略します。
+2. 候補が判明したら、関連パスと影響シンボルを 1 つの物化バッチにまとめ、MCP が Hash を更新確認して必要な領域、影響、文書、ルール、Skill を返します。
+3. 各 bundle の後で累積コンテキストを判断し、不足していれば必要なパス、シンボル、検索目標をまとめて次の広いバッチを要求します。ファイルを 1 つずつ読みません。
+4. コンテキストが十分になった時点で、Codex は全変更を含む 1 つの `edit-plan.v1` を送ります。
+5. `apply_compact_edit` がロック、Hash 再確認、原子的コミット、検証、再インデックス、安全なロールバックを行います。
 
 通常は PHP 8.2+、SQLite 拡張、Git だけで動作します。Composer と Node.js は任意の配布入口です。npm は依存関係のないプロセスラッパーで、同じ PHP STDIO Server がプロトコルを処理します。
 
@@ -89,7 +90,7 @@ knowledge:
 ## 推奨 Codex フロー
 
 ```markdown
-- Call get_edit_bundle once with the task, all known paths, and affected symbols.
+- Use get_edit_bundle first for architecture discovery when targets are unknown, then submit all known paths and affected symbols in broad materialization batches; request another batch only when accumulated context is insufficient.
 - Use returned regions, hashes, impacts, docs, and Skills instead of repository-wide scans.
 - Submit one edit-plan.v1 and call apply_compact_edit once.
 - Use get_edit_status and rollback_edit for recovery only.

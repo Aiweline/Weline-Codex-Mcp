@@ -68,8 +68,14 @@ final class ProjectRetriever
             } else {
                 $phaseStarted = hrtime(true);
                 $this->addChannel($scores, $this->exactCandidates($query, $options, $candidateLimit), 'exact', 3.0);
+                $exactMilliseconds = $this->elapsedMilliseconds($phaseStarted);
+                $telemetry['phases_ms']['exact'] = $exactMilliseconds;
+
+                $phaseStarted = hrtime(true);
                 $this->addChannel($scores, $this->ftsCandidates($query, $options, $candidateLimit), 'fts', 1.7);
-                $telemetry['phases_ms']['exact_fts'] = $this->elapsedMilliseconds($phaseStarted);
+                $ftsMilliseconds = $this->elapsedMilliseconds($phaseStarted);
+                $telemetry['phases_ms']['fts'] = $ftsMilliseconds;
+                $telemetry['phases_ms']['exact_fts'] = round($exactMilliseconds + $ftsMilliseconds, 3);
 
                 $phaseStarted = hrtime(true);
                 $state = $this->index->state();
@@ -84,8 +90,15 @@ final class ProjectRetriever
                 $telemetry['phases_ms']['trigram_cjk'] = $this->elapsedMilliseconds($phaseStarted);
 
                 $phaseStarted = hrtime(true);
-                $this->addChannel($scores, $this->sparseCandidates($query, $options, $candidateLimit), 'sparse', 2.0);
+                $sparseMeta = [];
+                $this->addChannel(
+                    $scores,
+                    $this->sparseCandidates($query, $options, $candidateLimit, $sparseMeta),
+                    'sparse',
+                    2.0,
+                );
                 $telemetry['phases_ms']['sparse'] = $this->elapsedMilliseconds($phaseStarted);
+                $telemetry['sparse'] = $sparseMeta;
             }
 
             if ($scores === []) {
@@ -247,6 +260,9 @@ final class ProjectRetriever
         $searchBudget = max(256, $regionBudget - $symbolReserve);
         $perRegionBudget = max(64, min(600, (int) floor($searchBudget / max(1, $maxRegions))));
         $retrievalQuery = $this->expandRetrievalQuery($task);
+        if ($symbols !== []) {
+            $retrievalQuery .= ' ' . implode(' ', $symbols);
+        }
         $phaseStarted = hrtime(true);
         $search = $this->search($retrievalQuery, [
             'paths' => $requestedPaths,
@@ -307,7 +323,10 @@ final class ProjectRetriever
         $impacts = [];
         $impactBatchMeta = ['sql_round_trips' => 0, 'target_count' => count($impactTargets)];
         try {
-            $batchInspection = $this->inspectSymbolsBatch(array_keys($impactTargets));
+            $batchInspection = $this->inspectSymbolsBatch(
+                array_keys($impactTargets),
+                $retrievalQuery,
+            );
             $impactBatchMeta = $batchInspection['meta'];
             foreach ($impactTargets as $symbol => $targetMetadata) {
                 $inspection = $batchInspection['inspections'][$symbol] ?? ['symbols' => [], 'impact' => []];
@@ -336,8 +355,14 @@ final class ProjectRetriever
                         'kind' => 'code',
                         'language' => '',
                         'module' => '',
-                        'start_line' => (int) ($definition['start_line'] ?? 1),
-                        'end_line' => (int) ($definition['end_line'] ?? $definition['start_line'] ?? 1),
+                        'start_line' => (int) ($definition['start_line'] ?? 1)
+                            + (int) ($snippet['line_offset'] ?? 0),
+                        'end_line' => min(
+                            (int) ($definition['end_line'] ?? $definition['start_line'] ?? 1),
+                            (int) ($definition['start_line'] ?? 1)
+                                + (int) ($snippet['line_offset'] ?? 0)
+                                + max(0, substr_count((string) $snippet['text'], "\n")),
+                        ),
                         'symbol_uid' => $definition['symbol_uid'] ?? '',
                         'symbol' => $definition['fq_name'] ?? $definition['name'] ?? $symbol,
                         'reason' => 'requested_symbol',
@@ -450,6 +475,12 @@ final class ProjectRetriever
             'performance' => [
                 'total_ms' => $totalMilliseconds,
                 'phases_ms' => $phaseTimings,
+                'retrieval' => [
+                    'strategy' => $search['retrieval']['strategy'] ?? '',
+                    'timing_ms' => is_array($search['retrieval']['timing_ms'] ?? null)
+                        ? $search['retrieval']['timing_ms']
+                        : [],
+                ],
                 'cache' => [
                     'path_scope' => $search['retrieval']['cache']['status'] ?? 'not_requested',
                     'index_revision' => $this->index->revision(),
@@ -470,6 +501,22 @@ final class ProjectRetriever
         if ($results === [] || $requestedPaths !== []) {
             return $results;
         }
+        $lowerTask = mb_strtolower($task, 'UTF-8');
+        $containsAny = static function (string $value, array $needles): bool {
+            foreach ($needles as $needle) {
+                if (str_contains($value, $needle)) {
+                    return true;
+                }
+            }
+
+            return false;
+        };
+        $documentationIntent = $containsAny($lowerTask, ['文档', 'documentation', 'readme', ' doc']);
+        $codeIntent = $containsAny($lowerTask, [
+            '代码', '方法', '函数', '符号', 'sql', '性能', '耗时', '延迟', '报错', '错误',
+            'bug', 'fix', 'implement', 'refactor', 'latency', 'slow',
+        ]) || (!$documentationIntent && $containsAny($lowerTask, ['优化', '修复', '实现', '重构', '修改']));
+
         $signals = [];
         $groups = [
             ['needles' => ['搜索', '检索', 'search'], 'paths' => ['search', 'query', 'filter', '检索', '过滤']],
@@ -478,10 +525,11 @@ final class ProjectRetriever
             ['needles' => ['分页', 'pagination'], 'paths' => ['pagination', 'page', '分页']],
             ['needles' => ['后台', 'backend', 'admin'], 'paths' => ['backend', 'admin', '后台']],
             ['needles' => ['界面', '交互', ' ui', 'view'], 'paths' => ['view', 'template', '.phtml', 'ui', '界面']],
-            ['needles' => ['文档', 'documentation', ' doc'], 'paths' => ['/doc/', 'readme', '.md']],
             ['needles' => ['mcp'], 'paths' => ['/mcp/', 'mcp']],
         ];
-        $lowerTask = mb_strtolower($task, 'UTF-8');
+        if ($documentationIntent && !$codeIntent) {
+            $groups[] = ['needles' => ['文档', 'documentation', 'readme', ' doc'], 'paths' => ['/doc/', 'readme', '.md']];
+        }
         foreach ($groups as $group) {
             foreach ($group['needles'] as $needle) {
                 if (str_contains($lowerTask, $needle)) {
@@ -491,18 +539,24 @@ final class ProjectRetriever
             }
         }
         $signals = array_values(array_unique($signals));
-        if ($signals === []) {
+        if ($signals === [] && !$codeIntent && !$documentationIntent) {
             return $results;
         }
 
         $ranked = [];
         foreach ($results as $position => $result) {
             $path = mb_strtolower((string) ($result['relative_path'] ?? ''), 'UTF-8');
+            $kind = mb_strtolower((string) ($result['file_kind'] ?? ''), 'UTF-8');
             $boost = 0;
             foreach ($signals as $signal) {
                 if (str_contains($path, mb_strtolower($signal, 'UTF-8'))) {
                     ++$boost;
                 }
+            }
+            if ($codeIntent && in_array($kind, ['code', 'config', 'rule'], true)) {
+                $boost += 2;
+            } elseif ($documentationIntent && $kind === 'doc') {
+                $boost += 2;
             }
             $ranked[] = ['item' => $result, 'boost' => $boost, 'position' => $position];
         }
@@ -616,7 +670,7 @@ final class ProjectRetriever
      *   meta:array<string,int>
      * }
      */
-    private function inspectSymbolsBatch(array $targets): array
+    private function inspectSymbolsBatch(array $targets, string $contextQuery = ''): array
     {
         $targets = array_slice(array_values(array_unique(array_filter(
             array_map('trim', $targets),
@@ -625,7 +679,12 @@ final class ProjectRetriever
         if ($targets === []) {
             return [
                 'inspections' => [],
-                'meta' => ['sql_round_trips' => 0, 'target_count' => 0, 'definition_count' => 0],
+                'meta' => [
+                    'sql_round_trips' => 0,
+                    'target_count' => 0,
+                    'definition_count' => 0,
+                    'context_definition_count' => 0,
+                ],
             ];
         }
 
@@ -660,14 +719,74 @@ final class ProjectRetriever
             }
         }
 
+        $classRows = array_filter(
+            $allRows,
+            static fn (array $row): bool => in_array(
+                (string) ($row['kind'] ?? ''),
+                ['class', 'interface', 'trait', 'enum'],
+                true,
+            ),
+        );
+        $membersByParent = [];
+        $memberRoundTrips = 0;
+        if ($contextQuery !== '' && $classRows !== []) {
+            $parentPlaceholders = [];
+            $memberParams = [];
+            foreach (array_keys($classRows) as $index => $parentUid) {
+                $key = 'batch_parent_uid_' . $index;
+                $parentPlaceholders[] = ':' . $key;
+                $memberParams[$key] = $parentUid;
+            }
+            $memberStatement = $this->index->pdo()->prepare(
+                'SELECT s.*, f.path, f.content_hash AS file_hash, f.indexed_at, c.content AS chunk_content
+                   FROM symbols s JOIN indexed_files f ON f.id = s.file_id
+              LEFT JOIN chunks c ON c.chunk_id = s.chunk_id
+                  WHERE s.parent_uid IN (' . implode(',', $parentPlaceholders) . ')
+                    AND s.kind = \'method\'
+               ORDER BY s.parent_uid, s.start_line
+                  LIMIT ' . max(1, count($classRows) * 24)
+            );
+            $memberStatement->execute($memberParams);
+            $memberRoundTrips = 1;
+            foreach ($memberStatement->fetchAll() as $memberRow) {
+                $membersByParent[(string) ($memberRow['parent_uid'] ?? '')][] = $memberRow;
+            }
+        }
+
         [$graph, $graphRoundTrips] = $this->batchUpstreamGraph(array_values($allRows));
         $inspections = [];
+        $contextDefinitionCount = 0;
         foreach ($targets as $target) {
             $definitionRows = array_values($rowsByTarget[$target]);
-            $definitions = array_map(
-                fn (array $row): array => $this->formatBatchSymbol($row, $target),
-                $definitionRows,
-            );
+            $definitionUids = [];
+            $contextRows = [];
+            foreach ($definitionRows as $definitionRow) {
+                $uid = (string) $definitionRow['symbol_uid'];
+                $definitionUids[$uid] = true;
+                $contextRows[$uid] = $definitionRow;
+                if (!in_array(
+                    (string) ($definitionRow['kind'] ?? ''),
+                    ['class', 'interface', 'trait', 'enum'],
+                    true,
+                )) {
+                    continue;
+                }
+                $memberRows = $this->rankClassMemberRows(
+                    $membersByParent[$uid] ?? [],
+                    $contextQuery,
+                );
+                foreach (array_slice($memberRows, 0, 4) as $memberRow) {
+                    $contextRows[(string) $memberRow['symbol_uid']] = $memberRow;
+                }
+            }
+            $definitions = [];
+            foreach ($contextRows as $uid => $row) {
+                $definitions[] = $this->formatBatchSymbol(
+                    $row,
+                    isset($definitionUids[$uid]) ? $target : $contextQuery,
+                );
+            }
+            $contextDefinitionCount += count($definitions);
             $relations = $this->relationsForBatchTarget($definitionRows, $graph);
             $inspections[$target] = [
                 'symbols' => $definitions,
@@ -679,12 +798,70 @@ final class ProjectRetriever
         return [
             'inspections' => $inspections,
             'meta' => [
-                'sql_round_trips' => 1 + $graphRoundTrips,
+                'sql_round_trips' => 1 + $memberRoundTrips + $graphRoundTrips,
                 'target_count' => count($targets),
                 'definition_count' => count($allRows),
+                'context_definition_count' => $contextDefinitionCount,
                 'relation_count' => count($graph),
             ],
         ];
+    }
+
+    /**
+     * @param list<array<string,mixed>> $rows
+     * @return list<array<string,mixed>>
+     */
+    private function rankClassMemberRows(array $rows, string $query): array
+    {
+        if ($rows === []) {
+            return [];
+        }
+        $lowerQuery = mb_strtolower($query, 'UTF-8');
+        $terms = [];
+        if (preg_match_all('/[\p{L}\p{N}_]{3,}/u', $lowerQuery, $matches) !== false) {
+            $terms = array_values(array_unique($matches[0] ?? []));
+        }
+        $ranked = [];
+        foreach ($rows as $position => $row) {
+            $name = mb_strtolower((string) ($row['name'] ?? ''), 'UTF-8');
+            $signature = mb_strtolower((string) ($row['signature'] ?? ''), 'UTF-8');
+            $score = $name !== '' && str_contains($lowerQuery, $name) ? 100 : 0;
+            foreach ($terms as $term) {
+                if ($term === $name) {
+                    $score += 20;
+                } elseif ($name !== '' && (str_contains($name, $term) || str_contains($term, $name))) {
+                    $score += 4;
+                } elseif (str_contains($signature, $term)) {
+                    ++$score;
+                }
+            }
+            if (preg_match('/\bpublic\b/i', $signature) === 1) {
+                $score += 2;
+            } elseif (preg_match('/\bprotected\b/i', $signature) === 1) {
+                ++$score;
+            }
+            $ranked[] = [
+                'row' => $row,
+                'score' => $score,
+                'start_line' => (int) ($row['start_line'] ?? PHP_INT_MAX),
+                'position' => $position,
+            ];
+        }
+        usort($ranked, static function (array $left, array $right): int {
+            if ($left['score'] !== $right['score']) {
+                return $right['score'] <=> $left['score'];
+            }
+            if ($left['start_line'] !== $right['start_line']) {
+                return $left['start_line'] <=> $right['start_line'];
+            }
+
+            return $left['position'] <=> $right['position'];
+        });
+
+        return array_values(array_map(
+            static fn (array $item): array => $item['row'],
+            $ranked,
+        ));
     }
 
     /** @param array<string,mixed> $row */
@@ -714,8 +891,13 @@ final class ProjectRetriever
             'absolute_path' => $this->index->absolutePath((string) $row['path']),
             'file_hash' => $row['file_hash'],
             'body_hash' => $row['body_hash'],
-            'start_line' => (int) $row['start_line'],
-            'end_line' => (int) $row['end_line'],
+            'start_line' => (int) $row['start_line'] + (int) ($snippet['line_offset'] ?? 0),
+            'end_line' => min(
+                (int) $row['end_line'],
+                (int) $row['start_line']
+                    + (int) ($snippet['line_offset'] ?? 0)
+                    + max(0, substr_count((string) $snippet['text'], "\n")),
+            ),
             'snippet' => $snippet['text'],
         ];
     }
@@ -1843,28 +2025,117 @@ final class ProjectRetriever
         return round((hrtime(true) - $started) / 1_000_000, 3);
     }
 
+    /** @return list<string> */
+    private function exactLookupTerms(string $query): array
+    {
+        $terms = [];
+        $append = static function (string $value) use (&$terms): void {
+            $value = trim($value, " \t\n\r\0\x0B\"'()[]{}<>,;");
+            if ($value === '' || mb_strlen($value, 'UTF-8') > 256) {
+                return;
+            }
+            $key = mb_strtolower($value, 'UTF-8');
+            $terms[$key] ??= $value;
+        };
+
+        $trimmed = trim($query);
+        if ($trimmed !== '' && mb_strlen($trimmed, 'UTF-8') <= 256
+            && preg_match('/\s/u', $trimmed) !== 1) {
+            $append($trimmed);
+        }
+        if (preg_match_all('~[A-Za-z_][A-Za-z0-9_]*(?:(?:\\\\|::|/|\.|-)[A-Za-z0-9_]+)*~', $query, $matches) === false) {
+            return array_values($terms);
+        }
+        foreach ($matches[0] ?? [] as $candidate) {
+            $qualified = preg_match('~(?:\\\\|::|/|\.|_|-)~', $candidate) === 1;
+            $identifier = preg_match('/[a-z0-9][A-Z]/', $candidate) === 1
+                || preg_match('/^[A-Z][A-Za-z0-9]{2,}$/', $candidate) === 1;
+            if (!$qualified && !$identifier) {
+                continue;
+            }
+            $append($candidate);
+            if ($qualified) {
+                $parts = preg_split('~(?:\\\\|::|/|\.|_|-)+~', $candidate, -1, PREG_SPLIT_NO_EMPTY) ?: [];
+                foreach (array_slice($parts, -2) as $part) {
+                    if (mb_strlen($part, 'UTF-8') >= 3) {
+                        $append($part);
+                    }
+                }
+            }
+            if (count($terms) >= 12) {
+                break;
+            }
+        }
+
+        return array_slice(array_values($terms), 0, 12);
+    }
+
     /** @return list<array{chunk_id:string,raw:float}> */
     private function exactCandidates(string $query, array $options, int $limit): array
     {
-        [$filter, $params] = $this->filterSql($options, 'f', 'exact');
-        $params['exact_query'] = $query;
-        $params['exact_contains'] = '%' . $this->escapeLike($query) . '%';
+        $terms = $this->exactLookupTerms($query);
+        if ($terms === []) {
+            return [];
+        }
+
+        $params = [];
+        $placeholders = [];
+        foreach ($terms as $index => $term) {
+            $key = 'exact_term_' . $index;
+            $placeholders[] = ':' . $key;
+            $params[$key] = $term;
+        }
+        $termList = implode(',', $placeholders);
+
+        $moduleConditions = [];
+        $moduleKeys = [];
+        foreach ($terms as $index => $term) {
+            if (preg_match('~^([A-Z][A-Za-z0-9]*)[/_]([A-Z][A-Za-z0-9]*)$~D', $term, $matches) !== 1) {
+                continue;
+            }
+            $moduleKey = $matches[1] . '/' . $matches[2];
+            if (isset($moduleKeys[$moduleKey])) {
+                continue;
+            }
+            $moduleKeys[$moduleKey] = true;
+            $vendorKey = 'exact_module_vendor_' . $index;
+            $nameKey = 'exact_module_name_' . $index;
+            $moduleConditions[] = '(ef.module_vendor = :' . $vendorKey
+                . ' AND ef.module_name = :' . $nameKey . ')';
+            $params[$vendorKey] = $matches[1];
+            $params[$nameKey] = $matches[2];
+        }
+        $moduleCandidates = '';
+        if ($moduleConditions !== []) {
+            $moduleCandidates = '
+                UNION ALL
+                SELECT c.chunk_id, 9.0
+                  FROM indexed_files ef JOIN chunks c ON c.file_id = ef.id
+                 WHERE ' . implode(' OR ', $moduleConditions);
+        }
+
+        [$filter, $filterParams] = $this->filterSql($options, 'f', 'exact');
+        $params = array_replace($params, $filterParams);
         $statement = $this->index->pdo()->prepare(
-            "SELECT c.chunk_id,
-                    MAX(CASE WHEN f.path = :exact_query COLLATE NOCASE THEN 12
-                             WHEN s.fq_name = :exact_query COLLATE NOCASE THEN 11
-                             WHEN s.name = :exact_query COLLATE NOCASE THEN 10
-                             WHEN f.module_vendor || '_' || f.module_name = :exact_query COLLATE NOCASE THEN 9
-                             WHEN f.module_vendor || '/' || f.module_name = :exact_query COLLATE NOCASE THEN 9
-                             WHEN f.path LIKE :exact_contains ESCAPE '\\' THEN 5 ELSE 1 END) AS raw
-               FROM chunks AS c JOIN indexed_files AS f ON f.id = c.file_id
-          LEFT JOIN symbols AS s ON s.file_id = f.id AND (s.chunk_id = c.chunk_id OR s.symbol_uid = c.symbol_uid)
-              WHERE (f.path LIKE :exact_contains ESCAPE '\\'
-                 OR s.name = :exact_query COLLATE NOCASE OR s.fq_name = :exact_query COLLATE NOCASE
-                 OR s.fq_name LIKE :exact_contains ESCAPE '\\'
-                 OR f.module_vendor || '_' || f.module_name = :exact_query COLLATE NOCASE
-                 OR f.module_vendor || '/' || f.module_name = :exact_query COLLATE NOCASE)" . $filter . '
-           GROUP BY c.chunk_id ORDER BY raw DESC, c.chunk_id LIMIT ' . $limit
+            'WITH candidates(chunk_id, raw) AS (
+                SELECT c.chunk_id,
+                       CASE WHEN s.fq_name COLLATE NOCASE IN (' . $termList . ') THEN 11.0 ELSE 10.0 END
+                  FROM symbols s JOIN chunks c ON c.chunk_id = s.chunk_id
+                 WHERE s.fq_name COLLATE NOCASE IN (' . $termList . ')
+                    OR s.name COLLATE NOCASE IN (' . $termList . ')
+                UNION ALL
+                SELECT c.chunk_id, 12.0
+                  FROM indexed_files ef JOIN chunks c ON c.file_id = ef.id
+                 WHERE ef.path IN (' . $termList . ')' . $moduleCandidates . '
+            )
+            SELECT candidate.chunk_id, MAX(candidate.raw) AS raw
+              FROM candidates candidate
+              JOIN chunks c ON c.chunk_id = candidate.chunk_id
+              JOIN indexed_files f ON f.id = c.file_id
+             WHERE 1=1' . $filter . '
+          GROUP BY candidate.chunk_id
+          ORDER BY raw DESC, candidate.chunk_id
+             LIMIT ' . $limit
         );
         $statement->execute($params);
 
@@ -1933,13 +2204,76 @@ final class ProjectRetriever
         return $this->candidateRows($statement->fetchAll(), 'raw');
     }
 
-    /** @return list<array{chunk_id:string,raw:float}> */
-    private function sparseCandidates(string $query, array $options, int $limit): array
+    /** @return list<string> */
+    private function focusedSparseTokens(string $query): array
     {
-        $vector = $this->vectorizer->vectorize($query);
+        $ranked = [];
+        foreach ($this->vectorizer->tokens($query) as $position => $token) {
+            [$kind, $value] = array_pad(explode(':', $token, 2), 2, '');
+            if ($value === '' || $kind === 'cjk1') {
+                continue;
+            }
+            $priority = match (true) {
+                $kind === 'raw' && preg_match('~[\\\\:/. _-]~', str_replace(' ', '', $value)) === 1 => 6,
+                $kind === 'word' && preg_match('/^[a-z0-9_]{3,}$/i', $value) === 1 => 5,
+                $kind === 'raw' && preg_match('/^[a-z0-9_]{3,}$/i', $value) === 1 => 4,
+                $kind === 'cjk3' => 3,
+                $kind === 'word' && mb_strlen($value, 'UTF-8') <= 8 => 3,
+                $kind === 'cjk2' => 2,
+                $kind === 'raw' => 1,
+                default => 0,
+            };
+            if ($priority === 0) {
+                continue;
+            }
+            $key = mb_strtolower($value, 'UTF-8');
+            if (isset($ranked[$key]) && $ranked[$key]['priority'] >= $priority) {
+                continue;
+            }
+            $ranked[$key] = [
+                'token' => $token,
+                'priority' => $priority,
+                'position' => isset($ranked[$key])
+                    ? min($ranked[$key]['position'], $position)
+                    : $position,
+            ];
+        }
+        uasort($ranked, static fn (array $left, array $right): int =>
+            [$right['priority'], $left['position']] <=> [$left['priority'], $right['position']]
+        );
+
+        return array_slice(array_column($ranked, 'token'), 0, 12);
+    }
+
+    /** @return list<array{chunk_id:string,raw:float}> */
+    private function sparseCandidates(
+        string $query,
+        array $options,
+        int $limit,
+        ?array &$meta = null,
+    ): array {
+        $vector = $this->vectorizer->vectorizeTokens($this->focusedSparseTokens($query), 12);
+        $meta = [
+            'query_terms' => count($vector),
+            'selected_terms' => 0,
+            'dropped_terms' => 0,
+            'query_postings' => 0,
+            'selected_postings' => 0,
+            'posting_budget' => 0,
+            'posting_stats_ms' => 0.0,
+            'candidate_score_ms' => 0.0,
+            'candidate_count' => 0,
+        ];
         if ($vector === []) {
             return [];
         }
+
+        [$vector, $selectionMeta] = $this->pruneSparseVector($vector, $limit);
+        $meta = array_replace($meta, $selectionMeta);
+        if ($vector === []) {
+            return [];
+        }
+
         $values = [];
         $params = [];
         $ordinal = 0;
@@ -1960,9 +2294,96 @@ final class ProjectRetriever
               WHERE 1=1' . $filter . '
            GROUP BY v.chunk_id HAVING raw > 0 ORDER BY raw DESC LIMIT ' . $limit
         );
+        $scoreStarted = hrtime(true);
         $statement->execute($params);
+        $rows = $this->candidateRows($statement->fetchAll(), 'raw');
+        $meta['candidate_score_ms'] = $this->elapsedMilliseconds($scoreStarted);
+        $meta['candidate_count'] = count($rows);
 
-        return $this->candidateRows($statement->fetchAll(), 'raw');
+        return $rows;
+    }
+
+    /**
+     * Keep the lowest-fanout feature hashes so collisions and broad words do
+     * not force every sparse query through tens of thousands of postings.
+     *
+     * @param array<int,float> $vector
+     * @return array{0:array<int,float>,1:array<string,int|float>}
+     */
+    private function pruneSparseVector(array $vector, int $candidateLimit): array
+    {
+        $started = hrtime(true);
+        $placeholders = [];
+        $params = [];
+        foreach (array_keys($vector) as $index => $hash) {
+            $key = 'sparse_df_' . $index;
+            $placeholders[] = ':' . $key;
+            $params[$key] = $hash;
+        }
+        $statement = $this->index->pdo()->prepare(
+            'SELECT term_hash, COUNT(*) AS posting_count
+               FROM chunk_vector_terms
+              WHERE term_hash IN (' . implode(',', $placeholders) . ')
+           GROUP BY term_hash'
+        );
+        $statement->execute($params);
+        $postingCounts = [];
+        foreach ($statement->fetchAll() as $row) {
+            $postingCounts[(int) $row['term_hash']] = (int) $row['posting_count'];
+        }
+
+        $ranked = [];
+        $queryPostings = 0;
+        foreach ($vector as $hash => $weight) {
+            $postings = (int) ($postingCounts[(int) $hash] ?? 0);
+            $queryPostings += $postings;
+            if ($postings <= 0) {
+                continue;
+            }
+            $ranked[] = [
+                'hash' => (int) $hash,
+                'weight' => (float) $weight,
+                'postings' => $postings,
+                'position' => count($ranked),
+            ];
+        }
+        usort($ranked, static function (array $left, array $right): int {
+            if ($left['postings'] !== $right['postings']) {
+                return $left['postings'] <=> $right['postings'];
+            }
+
+            return $left['position'] <=> $right['position'];
+        });
+
+        $minimumTerms = min(1, count($ranked));
+        $maximumTerms = min(8, count($ranked));
+        $postingBudget = max(2_500, min(20_000, $candidateLimit * 40));
+        $selected = [];
+        $selectedPostings = 0;
+        foreach ($ranked as $item) {
+            if (count($selected) >= $maximumTerms) {
+                break;
+            }
+            if (count($selected) >= $minimumTerms
+                && $selectedPostings + $item['postings'] > $postingBudget) {
+                break;
+            }
+            $selected[$item['hash']] = $item['weight'];
+            $selectedPostings += $item['postings'];
+        }
+
+        return [
+            $selected,
+            [
+                'query_terms' => count($vector),
+                'selected_terms' => count($selected),
+                'dropped_terms' => count($vector) - count($selected),
+                'query_postings' => $queryPostings,
+                'selected_postings' => $selectedPostings,
+                'posting_budget' => $postingBudget,
+                'posting_stats_ms' => $this->elapsedMilliseconds($started),
+            ],
+        ];
     }
 
     /** @param array<string,array{score:float,components:array<string,mixed>}> $scores
@@ -2524,6 +2945,7 @@ final class ProjectRetriever
                 'filesystem_scanned' => false,
                 'external_graph_invoked' => false,
                 'timing_ms' => array_replace(['total' => $durationMs], $telemetry['phases_ms'] ?? []),
+                'sparse' => is_array($telemetry['sparse'] ?? null) ? $telemetry['sparse'] : [],
                 'cache' => $telemetry['cache'] ?? [
                     'source' => 'project_sqlite_index',
                     'revision' => $this->index->revision(),

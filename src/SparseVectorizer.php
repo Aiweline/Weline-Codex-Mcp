@@ -63,15 +63,26 @@ final class SparseVectorizer
     /** @return array<int, float> Map of feature bucket to normalized signed weight. */
     public function vectorize(string $text): array
     {
+        return $this->vectorizeTokens($this->tokens($text));
+    }
+
+    /** @param list<string> $tokens
+     *  @return array<int, float> Map of feature bucket to normalized signed weight.
+     */
+    public function vectorizeTokens(array $tokens, ?int $maxTerms = null): array
+    {
         $frequencies = [];
-        foreach ($this->tokens($text) as $token) {
+        foreach ($tokens as $token) {
             $frequencies[$token] = ($frequencies[$token] ?? 0) + 1;
         }
         if ($frequencies === []) {
             return [];
         }
         arsort($frequencies, SORT_NUMERIC);
-        $frequencies = array_slice($frequencies, 0, $this->maxTerms, true);
+        $limit = $maxTerms === null
+            ? $this->maxTerms
+            : max(1, min($this->maxTerms, $maxTerms));
+        $frequencies = array_slice($frequencies, 0, $limit, true);
         $vector = [];
         foreach ($frequencies as $token => $frequency) {
             $digest = hash('sha256', $token, true);
