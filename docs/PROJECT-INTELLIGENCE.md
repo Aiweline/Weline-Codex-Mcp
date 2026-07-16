@@ -186,7 +186,9 @@ v1 只允许：
 
 `get_edit_status.files[]` 返回每个文件的 `operation_count`、`stage_strategy`、`stage_workers` 和 `stage_fork_fallbacks`；`apply_pipeline` 汇总文件数、操作数、并行策略和确定性提交方式。并发只发生在不同目标的临时文件准备阶段，永不让两个 worker 同时写同一目标路径。
 
-`apply_compact_edit` 先从 Draft 解析全部 project-relative path，去重并按字典序获取 `~/.learning-mcp/edit-locks/{project-hash}/{path-hash}.lock` 的进程级排他 `flock`。同文件调用在内核等待队列中串行；多文件计划使用同一固定顺序，不形成循环等待。锁从本地 Seal 前一直覆盖 Apply、固定验证、必要回滚、最终态定点索引和知识协调，所有返回或异常路径都在响应前释放；MCP 进程崩溃时操作系统释放所有权，持久 `.lock` 文件本身不表示仍被占用。
+`apply_compact_edit` 先从 Draft 解析全部 project-relative path，去重并按字典序获取 `~/.learning-mcp/edit-locks/{project-hash}/{path-hash}.lock` 的进程级排他 `flock`。同文件调用使用非阻塞探测加有界轮询；`editing.lock_timeout_ms` 到期后返回 `EDIT_LOCK_TIMEOUT`、等待时长和只用于诊断的 owner PID/Host/operation，多文件计划仍使用固定顺序，不形成循环等待。锁从本地 Seal 前一直覆盖 Apply、固定验证、必要回滚、最终态定点索引和知识协调，所有返回或异常路径都在响应前释放；MCP 进程崩溃或机器重启时操作系统释放所有权，持久 `.lock` 文件及其中可能残留的 owner JSON 本身都不表示仍被占用。
+
+每次新编辑以及 `apply_edit`、`get_edit_status`、`validate_change`、`rollback_edit` 会先检查当前项目数据库中的 `applying`、`rolling_back`、`recovery_required` 与 `rollback_blocked`。恢复器按同一“文件锁 → 项目锁”顺序重新取得保护并逐文件比较当前 Hash：`applying` 且全部为 postimage 时继续固定验证，失败自动回滚，成功再定点索引；全部 preimage 或只由 pre/postimage 构成的混合状态会逆序恢复 Journal preimage 并索引；任一未知 Hash 都只记录 `recovery_required` 和具体路径，不覆盖当前内容。单次调用有界处理 20 笔；若仍有积压，响应以 `has_more`/`remaining` 明示并在下一笔新写入前返回 `EDIT_RECOVERY_REQUIRED`，重试后继续下一批。
 
 拿到锁后，紧凑入口先对全部 target path 执行内容 Hash 定点刷新，把 submitted/locked/refreshed revision 记入审计元数据，再按刷新后的 revision 解析目标。Whole-file Hash 已变化时，不直接套用旧 offset：无 `occurrence` 的 `replace_text` 必须在最新版中唯一命中；`replace_range` 必须带匹配当前切片的 `expected_digest`；symbol/document section 继续由当前 UID/heading 与 body/section digest 保护。满足这些条件的非重叠计划可在最新版上安全重定位，封存后的 read-set 改用最新版文件 Hash；响应中的 `target_refresh` 可审计锁内核对结果。
 

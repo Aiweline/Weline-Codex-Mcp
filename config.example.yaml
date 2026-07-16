@@ -149,6 +149,10 @@ index:
 editing:
   enabled: true
   ticket_ttl: 10m
+  # Lock files persist as reusable flock carriers. Ownership is kernel state,
+  # while this bounded wait and poll interval prevent a live hung owner from blocking forever.
+  lock_timeout_ms: 30000
+  lock_poll_interval_ms: 50
   max_files: 20
   max_file_bytes: 1048576
   max_total_bytes: 4194304

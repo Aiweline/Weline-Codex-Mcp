@@ -6,7 +6,7 @@ namespace LearningMcp;
 
 final class ToolService
 {
-    public const VERSION = '0.9.0';
+    public const VERSION = '0.9.1';
     public const INSTRUCTIONS = 'Use Weline Project Intelligence as an architecture-first, batch-oriented workflow. Before native repository discovery or code/document reads, use get_edit_bundle as the normal read entry. '
         . 'When the owning subsystem or call chain is unclear, start with a discovery batch: pass the full task and relevant symbols/module/kinds, and omit paths only when intentionally asking the global index to discover unknown related files. '
         . 'Then materialize every known candidate path and affected symbol in one broad batch. After each bundle, reason over the accumulated context before editing. If definitions, callers, configuration, docs, rules, or architecture are still missing, collect all missing paths, symbols, and semantic search goals first and issue another broad get_edit_bundle batch; never degrade to one-file-at-a-time or native per-file reads. '
@@ -200,7 +200,7 @@ final class ToolService
             self::tool(
                 'apply_compact_edit',
                 'Apply compact local edit',
-                'Primary write entry. Queue equal file paths behind cross-session locks, refresh every target under the lock, merge non-overlapping same-file operations into one postimage, and stage distinct target files with bounded local parallel workers when available. The parent verifies every staged hash, commits ordered atomic renames, runs fixed validation, refreshes the final index, and rolls back automatically when validation fails unless disabled. A mismatched target returns EDIT_REPLAN_REQUIRED with target-symbol latest regions and the original task contract; the complete error is mirrored in structuredContent and legacy text content so deferred wrappers retain details. Generate a new plan from the exact matching region guards instead of guessing a digest, retrying, or patching stale operations.',
+                'Primary write entry. Reconcile crash-interrupted transactions first and refuse new writes while a bounded recovery backlog remains, then queue equal file paths behind bounded cross-session flock waits with owner diagnostics, refresh every target under the lock, merge non-overlapping same-file operations into one postimage, and stage distinct target files with bounded local parallel workers when available. The parent verifies every staged hash, commits ordered atomic renames, runs fixed validation, refreshes the final index, and rolls back automatically when validation fails unless disabled. A mismatched target returns EDIT_REPLAN_REQUIRED with target-symbol latest regions and the original task contract; the complete error is mirrored in structuredContent and legacy text content so deferred wrappers retain details. Generate a new plan from the exact matching region guards instead of guessing a digest, retrying, or patching stale operations.',
                 self::objectSchema($project + [
                     'plan' => self::editPlanSchema(),
                     'rollback_on_validation_failure' => ['type' => 'boolean'],
@@ -220,7 +220,7 @@ final class ToolService
             self::tool(
                 'get_edit_status',
                 'Get edit transaction status',
-                'Return a sealed edit transaction, apply state, validation state, and index revision without returning its secret token or hidden replacements.',
+                'Reconcile a crash-interrupted transaction by guarded pre/postimage hashes, then return its apply, recovery, validation, and index state without returning its secret token or hidden replacements.',
                 self::objectSchema($project + [
                     'edit_id' => self::stringSchema(),
                     'edit_token' => self::stringSchema(),

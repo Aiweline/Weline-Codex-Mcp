@@ -22,6 +22,7 @@ The normal runtime needs PHP 8.2+, SQLite extensions, and Git. Composer and Node
 - Exact path/symbol lookup plus full-text, trigram, local sparse retrieval, and symbol impact analysis.
 - Token-budgeted excerpts instead of repository dumps.
 - Cross-process file locks, deterministic multi-file lock order, hashes, journal, atomic replacement, validation, and safe rollback.
+- Bounded kernel `flock` waits with owner diagnostics; persistent `.lock` files do not represent ownership, and the next edit/status call reconciles crash-interrupted transactions by sealed pre/postimage hashes.
 - One independent `project.sqlite` per canonical Git root.
 - Evidence, scope, duplicate, conflict, confidence, maturity, expiration, and code-drift checks before generating `SKILL.md`.
 

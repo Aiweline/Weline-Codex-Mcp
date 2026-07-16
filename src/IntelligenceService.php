@@ -76,6 +76,10 @@ final class IntelligenceService
             'learning_projection_closed_loop' => true,
             'learning_projection_verification' => 'revision+file_hash+content_store+skill_metadata',
             'per_file_edit_lock_queue' => true,
+            'edit_lock_ownership' => 'kernel_flock_not_lockfile_existence',
+            'edit_lock_timeout_ms' => (int) $this->config->get('editing.lock_timeout_ms', 30_000),
+            'edit_lock_poll_interval_ms' => (int) $this->config->get('editing.lock_poll_interval_ms', 50),
+            'interrupted_edit_recovery' => 'next_edit_or_status_hash_reconciliation',
             'stale_edit_replan_regions' => true,
             'query_time_repository_scan' => false,
             'auto_refresh' => (bool) $this->config->get('index.auto_refresh', true),
@@ -584,6 +588,19 @@ final class IntelligenceService
             $submittedRevision = (int) ($draft['project_revision'] ?? $draft['index_revision'] ?? $index->revision());
             $draft['project_revision'] = $submittedRevision;
             $service = $this->editService($index);
+            $recovery = $service->recoverInterruptedTransactions();
+            if ((bool) ($recovery['requires_attention'] ?? false)
+                || (bool) ($recovery['has_more'] ?? false)) {
+                $message = (bool) ($recovery['requires_attention'] ?? false)
+                    ? 'An interrupted edit has unknown file hashes and must be inspected before new writes'
+                    : 'Interrupted edits remain after the bounded recovery batch; retry before new writes';
+                throw new ToolException(
+                    'EDIT_RECOVERY_REQUIRED',
+                    $message,
+                    false,
+                    ['recovery' => $recovery],
+                );
+            }
 
             return $service->withPlanFileLocks($draft, function (array $fileLock) use (
                 $index,
@@ -593,6 +610,7 @@ final class IntelligenceService
                 $submittedRevision,
                 $totalStartedAt,
                 $timingMs,
+                $recovery,
             ): array {
                 $timingMs['lock_wait'] = max(0, (int) ($fileLock['wait_ms'] ?? 0));
                 $lockedRevision = $index->revision();
@@ -707,6 +725,7 @@ final class IntelligenceService
                         ],
                         'rolled_back' => is_array($rolledBack),
                         'rollback_available' => !is_array($rolledBack),
+                        'interrupted_edit_recovery' => $recovery,
                         'timing_ms' => $timingMs,
                     ];
                 } catch (ToolException $exception) {
@@ -916,7 +935,15 @@ final class IntelligenceService
         $token = self::required($input, 'edit_token');
 
         return $this->withProject($input, false, function (ProjectIndex $index) use ($input, $token): array {
-            $result = $this->editService($index)->apply($token, trim((string) ($input['plan_digest'] ?? '')));
+            $service = $this->editService($index);
+            $recovery = $service->recoverInterruptedTransactions($token);
+            if ((bool) ($recovery['requires_attention'] ?? false)) {
+                throw new ToolException('EDIT_RECOVERY_REQUIRED', 'Interrupted edit recovery requires inspection', false, ['recovery' => $recovery]);
+            }
+            $result = ((int) ($recovery['recovered'] ?? 0)) > 0
+                ? $service->status($token)
+                : $service->apply($token, trim((string) ($input['plan_digest'] ?? '')));
+            $result['interrupted_edit_recovery'] = $recovery;
             $result['knowledge_state'] = $this->reconcileKnowledge($index, $this->editResultPaths($result));
             return $result;
         });
@@ -931,7 +958,11 @@ final class IntelligenceService
         }
 
         return $this->withProject($input, false, function (ProjectIndex $index) use ($id): array {
-            return $this->editService($index)->status($id);
+            $service = $this->editService($index);
+            $recovery = $service->recoverInterruptedTransactions($id);
+            $status = $service->status($id);
+            $status['interrupted_edit_recovery'] = $recovery;
+            return $status;
         });
     }
 
@@ -942,7 +973,15 @@ final class IntelligenceService
             if (isset($input['edit_token']) && !isset($input['token'])) {
                 $input['token'] = $input['edit_token'];
             }
-            return $this->editService($index)->validate($input);
+            $id = trim((string) ($input['edit_id'] ?? $input['token'] ?? ''));
+            $service = $this->editService($index);
+            if ($id !== '') {
+                $recovery = $service->recoverInterruptedTransactions($id);
+                if ((bool) ($recovery['requires_attention'] ?? false)) {
+                    throw new ToolException('EDIT_RECOVERY_REQUIRED', 'Interrupted edit recovery requires inspection', false, ['recovery' => $recovery]);
+                }
+            }
+            return $service->validate($input);
         });
     }
 
@@ -956,7 +995,10 @@ final class IntelligenceService
         }
 
         return $this->withProject($input, false, function (ProjectIndex $index) use ($id): array {
-            $result = $this->editService($index)->rollback($id);
+            $service = $this->editService($index);
+            $recovery = $service->recoverInterruptedTransactions($id);
+            $result = $service->rollback($id);
+            $result['interrupted_edit_recovery'] = $recovery;
             $result['knowledge_state'] = $this->reconcileKnowledge($index, $this->editResultPaths($result));
             return $result;
         });

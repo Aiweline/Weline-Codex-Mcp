@@ -22,6 +22,7 @@ final class EditService
     ];
 
     private const MAX_PARALLEL_STAGE_WORKERS = 4;
+    private const RECOVERY_BATCH_LIMIT = 20;
 
     private ProcessRunner $runner;
 
@@ -362,9 +363,13 @@ final class EditService
             try {
                 $staging = $this->stageSnapshots($snapshots);
                 foreach ($snapshots as &$snapshot) {
+                    $path = (string) $snapshot['path'];
+                    $stage = is_array($staging['files'][$path] ?? null) ? $staging['files'][$path] : [];
                     $snapshot['stage_strategy'] = $staging['strategy'];
                     $snapshot['stage_workers'] = $staging['workers'];
                     $snapshot['stage_fork_fallbacks'] = $staging['fork_fallbacks'];
+                    $snapshot['stage_temporary'] = (string) ($stage['temporary'] ?? '');
+                    $snapshot['stage_error_ref'] = (string) ($stage['error_ref'] ?? '');
                 }
                 unset($snapshot);
                 $this->updateTransaction($row, ['snapshots_json' => Json::encode($snapshots)]);
@@ -486,12 +491,12 @@ final class EditService
                 $indexResult = $this->indexer->indexPaths($paths);
             } catch (Throwable $exception) {
                 [$message] = Redactor::string($exception->getMessage());
+                $result = $this->transactionResult($row);
+                $result['paths'] = $paths;
+                $result['index_pending'] = true;
+                $result['index_reason'] = 'index_error';
                 $this->updateTransaction($row, [
-                    'result_json' => Json::encode([
-                        'paths' => $paths,
-                        'index_pending' => true,
-                        'index_reason' => 'index_error',
-                    ]),
+                    'result_json' => Json::encode($result),
                     'error_json' => Json::encode(['index_error' => Text::truncate($message, 2_000)]),
                 ]);
                 return [
@@ -503,13 +508,14 @@ final class EditService
             }
 
             $nextState = $state === 'applied_index_pending' ? 'applied' : $state;
+            $result = $this->transactionResult($row);
+            $result['paths'] = $paths;
+            $result['index_pending'] = false;
+            $result['index_reason'] = null;
+            $result['index_revision'] = $this->index->revision();
             $this->updateTransaction($row, [
                 $this->editStateColumn() => $nextState,
-                'result_json' => Json::encode([
-                    'paths' => $paths,
-                    'index_pending' => false,
-                    'index_revision' => $this->index->revision(),
-                ]),
+                'result_json' => Json::encode($result),
                 'error_json' => null,
             ]);
             return [
@@ -627,7 +633,10 @@ final class EditService
                 $status['already_rolled_back'] = true;
                 return $status;
             }
-            if (!in_array($state, ['applied', 'applied_index_pending', 'validated', 'validation_failed'], true)) {
+            if (!in_array($state, [
+                'applied', 'applied_index_pending', 'validated', 'validation_failed',
+                'recovery_required', 'rollback_blocked',
+            ], true)) {
                 throw new ToolException('EDIT_NOT_ROLLBACKABLE', 'Edit transaction is not rollbackable', false, ['state' => $state]);
             }
             $snapshots = $this->decodeSnapshots($row);
@@ -655,13 +664,13 @@ final class EditService
                 throw new ToolException('ROLLBACK_FAILED', 'Rollback encountered errors and requires manual recovery');
             }
             $paths = array_column($snapshots, 'path');
+            $result = $this->transactionResult($row);
+            $result['paths'] = $paths;
+            $result['index_pending'] = true;
+            $result['index_reason'] = 'rollback';
             $this->updateTransaction($row, [
                 $this->editStateColumn() => 'rolled_back',
-                'result_json' => Json::encode([
-                    'paths' => $paths,
-                    'index_pending' => true,
-                    'index_reason' => 'rollback',
-                ]),
+                'result_json' => Json::encode($result),
                 'error_json' => null,
             ]);
             $indexStartedAt = hrtime(true);
@@ -683,12 +692,11 @@ final class EditService
                 ];
                 return $status;
             }
+            $result['index_pending'] = false;
+            $result['index_reason'] = null;
+            $result['index_revision'] = $this->index->revision();
             $this->updateTransaction($row, [
-                'result_json' => Json::encode([
-                    'paths' => $paths,
-                    'index_pending' => false,
-                    'index_revision' => $this->index->revision(),
-                ]),
+                'result_json' => Json::encode($result),
             ]);
             $status = $this->status((string) $row[$this->editIdColumn()]);
             $status['index_refresh'] = [
@@ -700,6 +708,440 @@ final class EditService
         });
     }
 
+
+    /**
+     * Reconcile transactions left between durable state changes by a crashed
+     * MCP process. File locks are acquired before the project lock, matching
+     * the compact-edit lock order and preventing recovery/apply deadlocks.
+     *
+     * @return array<string, mixed>
+     */
+    public function recoverInterruptedTransactions(?string $idOrToken = null): array
+    {
+        $this->assertEnabled();
+        $rows = $this->interruptedTransactions($idOrToken);
+        $transactions = [];
+
+        foreach ($rows as $row) {
+            $editId = (string) $row[$this->editIdColumn()];
+            try {
+                $snapshots = $this->decodeSnapshots($row);
+                $paths = [];
+                foreach ($snapshots as $snapshot) {
+                    $paths[] = $this->safePath((string) $snapshot['path']);
+                }
+                $paths = array_values(array_unique($paths));
+                sort($paths, SORT_STRING);
+
+                $transactions[] = $this->withFileLocks(
+                    $paths,
+                    fn (array $fileLock): array => $this->recoverInterruptedTransaction($editId, $fileLock),
+                    'crash_recovery',
+                );
+            } catch (Throwable $exception) {
+                if ($exception instanceof ToolException && $exception->errorCode === 'EDIT_LOCK_TIMEOUT') {
+                    throw $exception;
+                }
+                [$message] = Redactor::string($exception->getMessage());
+                try {
+                    $this->withProjectLock(function () use ($editId, $message): void {
+                        $latest = $this->findTransaction($editId);
+                        if (in_array(
+                            (string) $latest[$this->editStateColumn()],
+                            ['applying', 'rolling_back', 'recovery_required', 'rollback_blocked'],
+                            true,
+                        )) {
+                            $this->updateTransaction($latest, [
+                                $this->editStateColumn() => 'recovery_required',
+                                'error_json' => Json::encode([
+                                    'crash_recovery' => [
+                                        'message' => Text::truncate($message, 2_000),
+                                        'checked_at' => Clock::now(),
+                                    ],
+                                ]),
+                            ]);
+                        }
+                    }, 'crash_recovery');
+                } catch (Throwable) {
+                }
+                $transactions[] = [
+                    'edit_id' => $editId,
+                    'outcome' => 'recovery_required',
+                    'error' => Text::truncate($message, 2_000),
+                ];
+            }
+        }
+
+        $requiresAttention = count(array_filter(
+            $transactions,
+            static fn (array $transaction): bool => ($transaction['outcome'] ?? '') === 'recovery_required',
+        ));
+        $recovered = count(array_filter(
+            $transactions,
+            static fn (array $transaction): bool => !in_array(
+                (string) ($transaction['outcome'] ?? ''),
+                ['skipped', 'recovery_required'],
+                true,
+            ),
+        ));
+        $remaining = $this->interruptedTransactionCount();
+        $hasMore = $remaining > 0;
+
+        return [
+            'status' => $requiresAttention > 0
+                ? 'attention_required'
+                : ($hasMore ? 'partial' : ($rows === [] ? 'clean' : 'completed')),
+            'checked' => count($rows),
+            'recovered' => $recovered,
+            'requires_attention' => $requiresAttention > 0,
+            'has_more' => $hasMore,
+            'remaining' => $remaining,
+            'transactions' => $transactions,
+        ];
+    }
+
+    private function interruptedTransactionCount(): int
+    {
+        $statement = $this->index->pdo()->query(
+            "SELECT COUNT(*) FROM edit_transactions WHERE " . $this->editStateColumn()
+            . " IN ('applying', 'rolling_back', 'recovery_required', 'rollback_blocked')"
+        );
+        return max(0, (int) $statement->fetchColumn());
+    }
+
+    /** @return list<array<string, mixed>> */
+    private function interruptedTransactions(?string $idOrToken): array
+    {
+        $states = ['applying', 'rolling_back', 'recovery_required', 'rollback_blocked'];
+        if ($idOrToken !== null && trim($idOrToken) !== '') {
+            $row = $this->findTransaction($idOrToken);
+            return in_array((string) $row[$this->editStateColumn()], $states, true) ? [$row] : [];
+        }
+
+        $placeholders = [];
+        $parameters = [];
+        foreach ($states as $index => $state) {
+            $placeholder = ':state_' . $index;
+            $placeholders[] = $placeholder;
+            $parameters['state_' . $index] = $state;
+        }
+        $statement = $this->index->pdo()->prepare(
+            'SELECT * FROM edit_transactions WHERE ' . $this->editStateColumn()
+            . ' IN (' . implode(', ', $placeholders) . ') ORDER BY updated_at ASC LIMIT '
+            . self::RECOVERY_BATCH_LIMIT
+        );
+        $statement->execute($parameters);
+        return array_values(array_filter($statement->fetchAll(), 'is_array'));
+    }
+
+    /** @param array<string, mixed> $fileLock
+     *  @return array<string, mixed>
+     */
+    private function recoverInterruptedTransaction(string $editId, array $fileLock): array
+    {
+        $decision = $this->withProjectLock(function () use ($editId): array {
+            $row = $this->findTransaction($editId);
+            $state = (string) $row[$this->editStateColumn()];
+            if (!in_array($state, ['applying', 'rolling_back', 'recovery_required', 'rollback_blocked'], true)) {
+                return [
+                    'edit_id' => $editId,
+                    'outcome' => 'skipped',
+                    'state' => $state,
+                ];
+            }
+
+            $snapshots = $this->decodeSnapshots($row);
+            $paths = array_values(array_map(
+                static fn (array $snapshot): string => (string) $snapshot['path'],
+                $snapshots,
+            ));
+            $classification = $this->classifySnapshotImages($snapshots);
+            $this->cleanupStagedSnapshots($this->recordedStagedSnapshots($snapshots));
+            $recovery = [
+                'trigger' => 'process_interruption',
+                'previous_state' => $state,
+                'checked_at' => Clock::now(),
+                'file_images' => $classification['counts'],
+            ];
+
+            if (($classification['counts']['unknown'] ?? 0) > 0) {
+                $unknown = array_values(array_filter(
+                    $classification['files'],
+                    static fn (array $file): bool => ($file['image'] ?? '') === 'unknown',
+                ));
+                $this->updateTransaction($row, [
+                    $this->editStateColumn() => 'recovery_required',
+                    'error_json' => Json::encode([
+                        'crash_recovery' => $recovery + ['unknown_files' => $unknown],
+                    ]),
+                ]);
+                return [
+                    'edit_id' => $editId,
+                    'outcome' => 'recovery_required',
+                    'state' => 'recovery_required',
+                    'unknown_files' => $unknown,
+                ];
+            }
+
+            $allPostimages = ($classification['counts']['post'] ?? 0) === count($snapshots);
+            if ($state === 'applying' && $allPostimages) {
+                $plan = Json::decode((string) ($row['plan_json'] ?? ''), []);
+                $profile = is_array($plan) ? (string) ($plan['validation_profile'] ?? 'default') : 'default';
+                $result = $this->transactionResult($row);
+                $result['paths'] = $paths;
+                $result['index_pending'] = true;
+                $result['index_reason'] = 'crash_recovery_validation_first';
+                $result['recovery'] = $recovery + ['outcome' => 'postimage_complete'];
+                $this->updateTransaction($row, [
+                    $this->editStateColumn() => 'applied_index_pending',
+                    'applied_at' => $row['applied_at'] ?? Clock::now(),
+                    'result_json' => Json::encode($result),
+                    'error_json' => null,
+                ]);
+                return [
+                    'action' => 'finalize_postimage',
+                    'edit_id' => $editId,
+                    'profile' => $profile,
+                    'previous_state' => $state,
+                ];
+            }
+
+            $errors = $this->restoreSnapshots(array_reverse($snapshots), true);
+            $this->cleanupSnapshotDirectories($snapshots);
+            if ($errors !== []) {
+                $this->updateTransaction($row, [
+                    $this->editStateColumn() => 'recovery_required',
+                    'error_json' => Json::encode([
+                        'crash_recovery' => $recovery + ['restore_errors' => $errors],
+                    ]),
+                ]);
+                return [
+                    'edit_id' => $editId,
+                    'outcome' => 'recovery_required',
+                    'state' => 'recovery_required',
+                    'restore_errors' => $errors,
+                ];
+            }
+
+            $result = $this->transactionResult($row);
+            $result['paths'] = $paths;
+            $result['index_pending'] = true;
+            $result['index_reason'] = 'crash_recovery_rollback';
+            $result['recovery'] = $recovery + ['outcome' => 'preimage_restored'];
+            $this->updateTransaction($row, [
+                $this->editStateColumn() => 'rolled_back',
+                'result_json' => Json::encode($result),
+                'error_json' => null,
+            ]);
+            return [
+                'action' => 'index_preimage',
+                'edit_id' => $editId,
+                'paths' => $paths,
+                'previous_state' => $state,
+            ];
+        }, 'crash_recovery');
+
+        if (($decision['action'] ?? '') === 'finalize_postimage') {
+            return $this->completeRecoveredPostimage(
+                (string) $decision['edit_id'],
+                (string) $decision['profile'],
+                (string) $decision['previous_state'],
+            );
+        }
+        if (($decision['action'] ?? '') === 'index_preimage') {
+            return $this->completeRecoveredPreimage(
+                (string) $decision['edit_id'],
+                is_array($decision['paths'] ?? null) ? $decision['paths'] : [],
+                (string) $decision['previous_state'],
+            );
+        }
+        return $decision;
+    }
+
+    /** @param list<string> $paths
+     *  @return array<string, mixed>
+     */
+    private function completeRecoveredPreimage(string $editId, array $paths, string $previousState): array
+    {
+        $startedAt = hrtime(true);
+        try {
+            $indexResult = $this->indexer->indexPaths($paths);
+        } catch (Throwable $exception) {
+            [$message] = Redactor::string($exception->getMessage());
+            $this->withProjectLock(function () use ($editId, $message): void {
+                $row = $this->findTransaction($editId);
+                $result = $this->transactionResult($row);
+                $result['index_pending'] = true;
+                $result['index_reason'] = 'crash_recovery_index_error';
+                $this->updateTransaction($row, [
+                    $this->editStateColumn() => 'rolled_back_index_pending',
+                    'result_json' => Json::encode($result),
+                    'error_json' => Json::encode(['index_error' => Text::truncate($message, 2_000)]),
+                ]);
+            }, 'crash_recovery');
+            $status = $this->status($editId);
+            $status['outcome'] = 'rolled_back_index_pending';
+            $status['previous_state'] = $previousState;
+            $status['index_refresh']['duration_ms'] = self::elapsedMilliseconds($startedAt);
+            return $status;
+        }
+
+        $this->withProjectLock(function () use ($editId): void {
+            $row = $this->findTransaction($editId);
+            $result = $this->transactionResult($row);
+            $result['index_pending'] = false;
+            $result['index_reason'] = null;
+            $result['index_revision'] = $this->index->revision();
+            $this->updateTransaction($row, [
+                $this->editStateColumn() => 'rolled_back',
+                'result_json' => Json::encode($result),
+                'error_json' => null,
+            ]);
+        }, 'crash_recovery');
+        $status = $this->status($editId);
+        $status['outcome'] = 'rolled_back';
+        $status['previous_state'] = $previousState;
+        $status['index_refresh'] = [
+            'status' => 'completed',
+            'result' => $indexResult,
+            'duration_ms' => self::elapsedMilliseconds($startedAt),
+        ];
+        return $status;
+    }
+
+    /** @return array<string, mixed> */
+    private function completeRecoveredPostimage(string $editId, string $profile, string $previousState): array
+    {
+        try {
+            $validation = $this->validate([
+                'edit_id' => $editId,
+                'profile' => $profile,
+            ]);
+            if (($validation['status'] ?? '') !== 'passed') {
+                $status = $this->rollback($editId);
+                $status['outcome'] = 'rolled_back_after_recovered_validation_failure';
+                $status['previous_state'] = $previousState;
+                $status['recovered_validation'] = [
+                    'id' => $validation['validation_id'] ?? null,
+                    'profile' => $validation['profile'] ?? $profile,
+                    'status' => $validation['status'] ?? 'failed',
+                ];
+                return $status;
+            }
+
+            $indexRefresh = $this->refreshIndex($editId);
+            $status = $this->status($editId);
+            $status['outcome'] = 'postimage_validated';
+            $status['previous_state'] = $previousState;
+            $status['recovered_validation'] = [
+                'id' => $validation['validation_id'] ?? null,
+                'profile' => $validation['profile'] ?? $profile,
+                'status' => 'passed',
+            ];
+            $status['index_refresh'] = $indexRefresh;
+            return $status;
+        } catch (Throwable $exception) {
+            [$message] = Redactor::string($exception->getMessage());
+            $this->withProjectLock(function () use ($editId, $message): void {
+                $row = $this->findTransaction($editId);
+                $this->updateTransaction($row, [
+                    $this->editStateColumn() => 'recovery_required',
+                    'error_json' => Json::encode([
+                        'crash_recovery' => [
+                            'message' => Text::truncate($message, 2_000),
+                            'checked_at' => Clock::now(),
+                        ],
+                    ]),
+                ]);
+            }, 'crash_recovery');
+            throw new ToolException(
+                'EDIT_RECOVERY_FAILED',
+                'Interrupted edit postimage recovery failed and requires inspection',
+                false,
+                ['edit_id' => $editId],
+            );
+        }
+    }
+
+    /**
+     * @param list<array<string, mixed>> $snapshots
+     * @return array{counts:array{pre:int,post:int,unknown:int},files:list<array<string, mixed>>}
+     */
+    private function classifySnapshotImages(array $snapshots): array
+    {
+        $counts = ['pre' => 0, 'post' => 0, 'unknown' => 0];
+        $files = [];
+        foreach ($snapshots as $snapshot) {
+            $path = $this->safePath((string) $snapshot['path']);
+            $this->assertNoSymlinkComponents($path);
+            $absolute = $this->index->root() . '/' . $path;
+            $actual = is_file($absolute) && !is_link($absolute) ? hash_file('sha256', $absolute) : false;
+            $image = 'unknown';
+
+            if (($snapshot['action'] ?? '') === 'create') {
+                if (!file_exists($absolute) && !is_link($absolute)) {
+                    $image = 'pre';
+                } elseif (is_string($actual) && $this->hashEquals((string) $snapshot['post_sha256'], $actual)) {
+                    $image = 'post';
+                }
+            } elseif (is_string($actual)) {
+                if (isset($snapshot['pre_sha256']) && $this->hashEquals((string) $snapshot['pre_sha256'], $actual)) {
+                    $image = 'pre';
+                } elseif ($this->hashEquals((string) $snapshot['post_sha256'], $actual)) {
+                    $image = 'post';
+                }
+            }
+
+            $counts[$image]++;
+            $files[] = [
+                'path' => $path,
+                'image' => $image,
+                'actual_sha256' => is_string($actual) ? 'sha256:' . $actual : null,
+            ];
+        }
+        return ['counts' => $counts, 'files' => $files];
+    }
+
+    /**
+     * @param list<array<string, mixed>> $snapshots
+     * @return array<string, array<string, mixed>>
+     */
+    private function recordedStagedSnapshots(array $snapshots): array
+    {
+        $staged = [];
+        foreach ($snapshots as $snapshot) {
+            $path = $this->safePath((string) $snapshot['path']);
+            $temporary = (string) ($snapshot['stage_temporary'] ?? '');
+            if ($temporary === '' || !str_starts_with(basename($temporary), '.learning-mcp-stage-')) {
+                continue;
+            }
+            $targetParent = realpath(dirname($this->index->root() . '/' . $path));
+            $temporaryParent = realpath(dirname($temporary));
+            if (!is_string($targetParent) || !is_string($temporaryParent) || !hash_equals($targetParent, $temporaryParent)) {
+                continue;
+            }
+            $errorRef = (string) ($snapshot['stage_error_ref'] ?? ($temporary . '.error'));
+            if (!hash_equals($temporary . '.error', $errorRef)) {
+                continue;
+            }
+            $staged[$path] = [
+                'path' => $path,
+                'temporary' => $temporary,
+                'error_ref' => $errorRef,
+            ];
+        }
+        return $staged;
+    }
+
+    /** @param array<string, mixed> $row
+     *  @return array<string, mixed>
+     */
+    private function transactionResult(array $row): array
+    {
+        $result = Json::decode((string) ($row['result_json'] ?? ''), []);
+        return is_array($result) ? $result : [];
+    }
+
     /**
      * Hold every target file lock for the complete compact edit lifecycle.
      *
@@ -708,7 +1150,7 @@ final class EditService
      */
     public function withPlanFileLocks(array $draft, callable $callback): mixed
     {
-        return $this->withFileLocks($this->planPaths($draft), $callback);
+        return $this->withFileLocks($this->planPaths($draft), $callback, 'apply_compact_edit');
     }
 
     /** @param array<string, mixed> $draft
@@ -752,7 +1194,7 @@ final class EditService
      * @param list<string> $paths
      * @param callable(array<string, mixed>): mixed $callback
      */
-    private function withFileLocks(array $paths, callable $callback): mixed
+    private function withFileLocks(array $paths, callable $callback, string $operation = 'edit_transaction'): mixed
     {
         $paths = array_values(array_unique($paths));
         sort($paths, SORT_STRING);
@@ -780,6 +1222,7 @@ final class EditService
 
         $handles = [];
         $contended = [];
+        $owner = null;
         $startedAt = hrtime(true);
         try {
             foreach ($paths as $path) {
@@ -794,22 +1237,27 @@ final class EditService
                     }
                     throw new ToolException('EDIT_LOCK_FAILED', 'Unable to open a file edit lock', true, ['path' => $path]);
                 }
-                if (!flock($handle, LOCK_EX | LOCK_NB)) {
-                    $contended[] = $path;
-                    if (!flock($handle, LOCK_EX)) {
-                        fclose($handle);
-                        throw new ToolException('EDIT_LOCK_FAILED', 'Unable to wait for a file edit lock', true, ['path' => $path]);
-                    }
+                try {
+                    $lock = $this->acquireExclusiveLock($handle, 'file', $path, $operation, $startedAt);
+                } catch (Throwable $exception) {
+                    fclose($handle);
+                    throw $exception;
                 }
+                if ($lock['contended']) {
+                    $contended[] = $path;
+                }
+                $owner = $lock['owner'];
                 $handles[] = ['path' => $path, 'handle' => $handle];
             }
 
             $lockContext = [
                 'strategy' => 'sorted_per_file_flock',
-                'queue' => 'kernel_wait_queue',
+                'queue' => 'bounded_nonblocking_flock',
                 'paths' => $paths,
                 'contended_paths' => $contended,
                 'wait_ms' => self::elapsedMilliseconds($startedAt),
+                'timeout_ms' => $this->lockTimeoutMs(),
+                'owner' => $owner,
             ];
             $result = $callback($lockContext);
         } finally {
@@ -824,6 +1272,140 @@ final class EditService
             $result['file_lock'] = array_merge($lockContext, ['status' => 'released']);
         }
         return $result;
+    }
+
+
+    /**
+     * @param resource $handle
+     * @return array{contended:bool,wait_ms:int,owner:array<string, mixed>}
+     */
+    private function acquireExclusiveLock(
+        $handle,
+        string $scope,
+        string $target,
+        string $operation,
+        int $startedAt,
+    ): array {
+        $timeoutMs = $this->lockTimeoutMs();
+        $pollMs = $this->lockPollIntervalMs();
+        $contended = false;
+
+        while (!flock($handle, LOCK_EX | LOCK_NB)) {
+            $contended = true;
+            $waitMs = self::elapsedMilliseconds($startedAt);
+            if ($waitMs >= $timeoutMs) {
+                $owner = $this->readLockOwner($handle);
+                throw new ToolException(
+                    'EDIT_LOCK_TIMEOUT',
+                    'Timed out waiting for an active edit lock',
+                    true,
+                    [
+                        'scope' => $scope,
+                        'target' => $target,
+                        'operation' => $operation,
+                        'wait_ms' => $waitMs,
+                        'timeout_ms' => $timeoutMs,
+                        'owner' => $owner,
+                        'lock_truth' => 'kernel_flock',
+                        'persistent_lock_file_is_ownership' => false,
+                    ],
+                );
+            }
+            $remainingMs = max(1, $timeoutMs - $waitMs);
+            usleep(min($pollMs, $remainingMs) * 1_000);
+        }
+
+        $owner = $this->currentLockOwner($scope, $target, $operation);
+        $this->writeLockOwner($handle, $owner);
+        return [
+            'contended' => $contended,
+            'wait_ms' => self::elapsedMilliseconds($startedAt),
+            'owner' => $owner,
+        ];
+    }
+
+    /** @return array<string, mixed> */
+    private function currentLockOwner(string $scope, string $target, string $operation): array
+    {
+        $host = gethostname();
+        return [
+            'pid' => getmypid(),
+            'host' => is_string($host) ? $host : '',
+            'started_at' => Clock::now(),
+            'project_id' => $this->index->projectId(),
+            'scope' => $scope,
+            'target' => $target,
+            'operation' => $operation,
+        ];
+    }
+
+    /** @param resource $handle
+     *  @param array<string, mixed> $owner
+     */
+    private function writeLockOwner($handle, array $owner): void
+    {
+        $payload = Json::encode($owner);
+        if (!@rewind($handle) || !@ftruncate($handle, 0)) {
+            return;
+        }
+        if (@fwrite($handle, $payload) === strlen($payload)) {
+            @fflush($handle);
+        }
+    }
+
+    /** @param resource $handle
+     *  @return array<string, mixed>|null
+     */
+    private function readLockOwner($handle): ?array
+    {
+        if (!@rewind($handle)) {
+            return null;
+        }
+        $payload = stream_get_contents($handle, 4_096);
+        if (!is_string($payload) || trim($payload) === '') {
+            return null;
+        }
+        try {
+            $owner = Json::decode($payload, []);
+        } catch (Throwable) {
+            return null;
+        }
+        if (!is_array($owner)) {
+            return null;
+        }
+        $owner['process_likely_alive'] = $this->lockOwnerProcessLikelyAlive($owner);
+        return $owner;
+    }
+
+    /** @param array<string, mixed> $owner */
+    private function lockOwnerProcessLikelyAlive(array $owner): ?bool
+    {
+        $pid = (int) ($owner['pid'] ?? 0);
+        $ownerHost = trim((string) ($owner['host'] ?? ''));
+        $host = gethostname();
+        if ($pid < 1 || !is_string($host) || $ownerHost === '' || !hash_equals($host, $ownerHost)) {
+            return null;
+        }
+        if ($pid === getmypid()) {
+            return true;
+        }
+        if (function_exists('posix_kill')) {
+            return @posix_kill($pid, 0);
+        }
+        return null;
+    }
+
+    private function lockTimeoutMs(): int
+    {
+        return max(100, min(300_000, (int) $this->config->get('editing.lock_timeout_ms', 30_000)));
+    }
+
+    private function lockPollIntervalMs(): int
+    {
+        return max(5, min(
+            $this->lockTimeoutMs(),
+            (int) $this->config->get('editing.lock_poll_interval_ms', 50),
+        ));
     }
 
     private function assertEnabled(): void
@@ -2098,7 +2680,7 @@ final class EditService
         return $commit;
     }
 
-    private function withProjectLock(callable $callback): mixed
+    private function withProjectLock(callable $callback, string $operation = 'edit_transaction'): mixed
     {
         $directory = rtrim($this->config->dataDir(), '/') . '/edit-locks';
         if (is_link($directory)) {
@@ -2110,16 +2692,28 @@ final class EditService
         @chmod($directory, 0700);
         $path = $directory . '/' . hash('sha256', $this->index->projectId()) . '.lock';
         $handle = fopen($path, 'c+b');
-        if (!is_resource($handle) || !chmod($path, 0600) || !flock($handle, LOCK_EX)) {
+        if (!is_resource($handle) || !chmod($path, 0600)) {
             if (is_resource($handle)) {
                 fclose($handle);
             }
-            throw new ToolException('EDIT_LOCK_FAILED', 'Unable to acquire the project edit lock', true);
+            throw new ToolException('EDIT_LOCK_FAILED', 'Unable to open the project edit lock', true);
         }
+        $acquired = false;
+        $startedAt = hrtime(true);
         try {
+            $this->acquireExclusiveLock(
+                $handle,
+                'project',
+                $this->index->projectId(),
+                $operation,
+                $startedAt,
+            );
+            $acquired = true;
             return $callback();
         } finally {
-            flock($handle, LOCK_UN);
+            if ($acquired) {
+                flock($handle, LOCK_UN);
+            }
             fclose($handle);
         }
     }
@@ -2148,6 +2742,9 @@ final class EditService
         $error = Json::decode((string) ($row['error_json'] ?? ''), null);
         $result = Json::decode((string) ($row['result_json'] ?? ''), []);
         $result = is_array($result) ? $result : [];
+        $recovery = is_array($result['recovery'] ?? null)
+            ? $result['recovery']
+            : (is_array($error['crash_recovery'] ?? null) ? $error['crash_recovery'] : null);
         $indexPending = (bool) ($result['index_pending'] ?? in_array(
             (string) $row[$this->editStateColumn()],
             ['applied_index_pending', 'rolled_back_index_pending'],
@@ -2182,6 +2779,7 @@ final class EditService
                 'index_revision' => $result['index_revision'] ?? null,
                 'recoverable' => $indexPending,
             ],
+            'recovery' => $recovery,
             'error' => $error,
         ];
     }

@@ -235,6 +235,8 @@ final class Config
             'editing' => [
                 'enabled' => true,
                 'ticket_ttl' => '10m',
+                'lock_timeout_ms' => 30_000,
+                'lock_poll_interval_ms' => 50,
                 'max_files' => 20,
                 'max_file_bytes' => 1_048_576,
                 'max_total_bytes' => 4_194_304,
@@ -346,6 +348,8 @@ final class Config
             'editing' => [
                 'enabled' => true,
                 'ticket_ttl' => true,
+                'lock_timeout_ms' => true,
+                'lock_poll_interval_ms' => true,
                 'max_files' => true,
                 'max_file_bytes' => true,
                 'max_total_bytes' => true,
@@ -495,6 +499,8 @@ final class Config
             'index.vector_max_terms' => [8, 1_024],
             'index.sqlite_mmap_bytes' => [0, 2_147_418_112],
             'index.sqlite_cache_kib' => [1_024, 262_144],
+            'editing.lock_timeout_ms' => [100, 300_000],
+            'editing.lock_poll_interval_ms' => [5, 1_000],
             'editing.max_files' => [1, 200],
             'editing.max_file_bytes' => [1_024, 16_777_216],
             'editing.max_total_bytes' => [1_024, 67_108_864],
