@@ -374,75 +374,99 @@ final class IntelligenceService
     {
         $task = self::required($input, 'task');
         $paths = self::strings($input['paths'] ?? []);
+        $symbols = array_slice(self::strings($input['symbols'] ?? []), 0, 24);
+        $defaultMaxRegions = $paths === [] ? 24 : min(48, max(24, count($paths) * 4));
+        $defaultTokenBudget = $paths === [] ? 8_000 : min(24_000, max(8_000, count($paths) * 1_200));
 
-        return $this->withProject($input, true, function (ProjectIndex $index) use ($input, $task, $paths): array {
-            $onDemandIndex = $this->refreshIndexedPaths($index, $paths);
-
-            $bundle = (new ProjectRetriever(
-                $index,
-                new SparseVectorizer($this->config),
-                $this->config,
-            ))->getEditBundle($task, [
-                'paths' => $paths,
-                'symbols' => array_slice(self::strings($input['symbols'] ?? []), 0, 12),
-                'module' => trim((string) ($input['module'] ?? '')),
-                'kinds' => self::strings($input['kinds'] ?? []),
-                'max_regions' => max(1, min(20, (int) ($input['max_regions'] ?? 8))),
-                'max_chunks_per_file' => max(1, min(4, (int) ($input['max_chunks_per_file'] ?? 2))),
-                'token_budget' => max(256, min(8_000, (int) ($input['token_budget'] ?? 1_800))),
-                'include_docs' => (bool) ($input['include_docs'] ?? true),
-                'include_skills' => (bool) ($input['include_skills'] ?? true),
-            ]);
-            if (is_array($onDemandIndex)) {
-                $bundle['on_demand_index'] = [
-                    'mode' => 'explicit_paths_refresh',
-                    'requested_paths' => self::strings($onDemandIndex['scope_paths'] ?? $paths),
-                    'changed_paths' => self::strings($onDemandIndex['changed_paths'] ?? []),
-                    'duration_ms' => max(0, (int) ($onDemandIndex['duration_ms'] ?? 0)),
-                    'project_revision' => $index->revision(),
-                ];
-            }
-            $learning = $this->learningContext(
-                $index->projectId(),
+        return $this->withProject(
+            $input,
+            true,
+            function (ProjectIndex $index) use (
+                $input,
                 $task,
                 $paths,
-                3,
-            );
-            $bundle['validated_learning'] = array_map(static fn (array $item): array => [
-                'title' => $item['title'] ?? '',
-                'rule' => $item['rule'] ?? '',
-                'trigger' => $item['trigger'] ?? '',
-                'confidence' => $item['confidence'] ?? 0,
-            ], $learning);
-            $bundle['routing'] = [
-                'phase' => $paths === [] ? 'discovery' : 'materialization',
-                'batch_request' => [
-                    'phase' => $paths === [] ? 'discovery' : 'materialization',
-                    'requested_path_count' => count($paths),
-                    'requested_symbol_count' => count(self::strings($input['symbols'] ?? [])),
-                    'requested_target_count' => count($paths) + count(self::strings($input['symbols'] ?? [])),
-                    'multi_path_batch' => count($paths) > 1,
-                    'single_file_round_trip' => count($paths) === 1
-                        && count(self::strings($input['symbols'] ?? [])) <= 1,
-                ],
-                'architecture_first' => true,
-                'context_policy' => 'Reason over all accumulated bundles before editing; do not treat one bounded response as automatically complete.',
-                'next' => 'First decide whether the owning architecture, definitions, callers, configuration, rules, docs, and complete modification set are known. If not, collect every missing path, symbol, and semantic search goal and request another broad get_edit_bundle batch. If yes, emit one complete edit-plan.v1 and call apply_compact_edit once.',
-                'batch_followup_allowed' => true,
-                'followup_request' => [
-                    'collect_paths' => true,
-                    'collect_symbols' => true,
-                    'collect_search_goals' => true,
-                    'single_file_round_trips' => false,
-                ],
-                'scan_required' => false,
-                'whole_file_read_required' => false,
-                'native_single_file_read_allowed' => false,
-                'write_contract' => 'Exactly one apply_compact_edit call after accumulated context is sufficient.',
-            ];
+                $symbols,
+                $defaultMaxRegions,
+                $defaultTokenBudget,
+            ): array {
+                $onDemandIndex = $this->refreshIndexedPaths($index, $paths);
 
-            return $bundle;
-        });
+                $bundle = (new ProjectRetriever(
+                    $index,
+                    new SparseVectorizer($this->config),
+                    $this->config,
+                ))->getEditBundle($task, [
+                    'paths' => $paths,
+                    'symbols' => $symbols,
+                    'module' => trim((string) ($input['module'] ?? '')),
+                    'kinds' => self::strings($input['kinds'] ?? []),
+                    'max_regions' => max(1, min(48, (int) ($input['max_regions'] ?? $defaultMaxRegions))),
+                    'max_chunks_per_file' => max(1, min(8, (int) ($input['max_chunks_per_file'] ?? 4))),
+                    'token_budget' => max(256, min(24_000, (int) ($input['token_budget'] ?? $defaultTokenBudget))),
+                    'include_docs' => (bool) ($input['include_docs'] ?? true),
+                    'include_skills' => (bool) ($input['include_skills'] ?? true),
+                ]);
+                if (is_array($onDemandIndex)) {
+                    $bundle['on_demand_index'] = [
+                        'mode' => 'explicit_paths_refresh',
+                        'requested_paths' => self::strings($onDemandIndex['scope_paths'] ?? $paths),
+                        'changed_paths' => self::strings($onDemandIndex['changed_paths'] ?? []),
+                        'duration_ms' => max(0, (int) ($onDemandIndex['duration_ms'] ?? 0)),
+                        'project_revision' => $index->revision(),
+                    ];
+                }
+                $learning = $this->learningContext(
+                    $index->projectId(),
+                    $task,
+                    $paths,
+                    3,
+                );
+                $bundle['validated_learning'] = array_map(static fn (array $item): array => [
+                    'title' => $item['title'] ?? '',
+                    'rule' => $item['rule'] ?? '',
+                    'trigger' => $item['trigger'] ?? '',
+                    'confidence' => $item['confidence'] ?? 0,
+                ], $learning);
+                $continuation = is_array($bundle['continuation'] ?? null)
+                    ? $bundle['continuation']
+                    : [];
+                $needsFollowup = (bool) ($continuation['needed'] ?? false);
+                $bundle['routing'] = [
+                    'phase' => $paths === [] ? 'discovery' : 'materialization',
+                    'batch_request' => [
+                        'phase' => $paths === [] ? 'discovery' : 'materialization',
+                        'requested_path_count' => count($paths),
+                        'requested_symbol_count' => count($symbols),
+                        'requested_target_count' => count($paths) + count($symbols),
+                        'multi_path_batch' => count($paths) > 1,
+                        'single_file_round_trip' => count($paths) === 1 && count($symbols) <= 1,
+                    ],
+                    'architecture_first' => true,
+                    'candidate_manifest_required' => true,
+                    'context_policy' => 'Read architecture, candidate_paths, candidate_roles, coverage, and continuation before deciding from regions. Reason over all accumulated bundles before editing.',
+                    'next' => $needsFollowup
+                        ? 'Use continuation.next_path_batches as broad materialization requests and combine all continuation.next_search_goals into one discovery request. Never request one path or one role at a time.'
+                        : 'The inferred role coverage is likely complete. If the accumulated exact regions are sufficient, emit one complete edit-plan.v1 and call apply_compact_edit once.',
+                    'batch_followup_allowed' => $needsFollowup,
+                    'followup_request' => [
+                        'path_batches' => is_array($continuation['next_path_batches'] ?? null)
+                            ? $continuation['next_path_batches']
+                            : [],
+                        'combined_search_goals' => is_array($continuation['next_search_goals'] ?? null)
+                            ? $continuation['next_search_goals']
+                            : [],
+                        'collect_symbols' => true,
+                        'single_file_round_trips' => false,
+                    ],
+                    'scan_required' => false,
+                    'whole_file_read_required' => false,
+                    'native_single_file_read_allowed' => false,
+                    'write_contract' => 'Exactly one apply_compact_edit call after accumulated context is sufficient.',
+                ];
+
+                return $bundle;
+            },
+        );
     }
 
     /** @param list<string> $paths
