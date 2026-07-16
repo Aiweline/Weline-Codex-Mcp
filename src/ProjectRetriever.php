@@ -352,6 +352,7 @@ final class ProjectRetriever
                     $region = [
                         'path' => $definition['relative_path'] ?? '',
                         'file_sha256' => $definition['file_hash'] ?? '',
+                        'expected_file_sha256' => $definition['file_hash'] ?? '',
                         'kind' => 'code',
                         'language' => '',
                         'module' => '',
@@ -365,6 +366,8 @@ final class ProjectRetriever
                         ),
                         'symbol_uid' => $definition['symbol_uid'] ?? '',
                         'symbol' => $definition['fq_name'] ?? $definition['name'] ?? $symbol,
+                        'target_ref' => $definition['fq_name'] ?? $definition['name'] ?? $symbol,
+                        'expected_digest' => $definition['body_hash'] ?? '',
                         'reason' => 'requested_symbol',
                         'content' => $snippet['text'],
                         'token_estimate' => $snippet['tokens'],
@@ -467,6 +470,16 @@ final class ProjectRetriever
                 'max_chunks_per_file' => $maxChunksPerFile,
                 'skill_reserved_tokens' => $skillReserve,
                 'skill_count' => count($skills),
+            ],
+            'edit_plan_contract' => [
+                'copy_region_guards' => [
+                    'path',
+                    'expected_file_sha256',
+                    'symbol_uid_or_target_ref',
+                    'expected_digest',
+                ],
+                'digest_rule' => 'Use expected_digest from the exact selected symbol region; content_sha256 is only the returned snippet digest and is not a symbol guard.',
+                'replan_rule' => 'On EDIT_REPLAN_REQUIRED, discard old operations and rebuild them from matching latest_regions guards.',
             ],
             'source' => 'project_sqlite_index',
             'selection' => $requestedPaths === []
@@ -1907,7 +1920,8 @@ final class ProjectRetriever
         $statement = $this->index->pdo()->prepare(
             'SELECT c.*, f.path, f.kind AS file_kind, f.language, f.module_vendor, f.module_name,
                     f.content_hash AS file_hash, f.revision AS file_revision, f.indexed_at,
-                    COALESCE(s.fq_name, s.name, \'\') AS symbol_name
+                    COALESCE(s.fq_name, s.name, \'\') AS symbol_name,
+                    COALESCE(s.body_hash, \'\') AS symbol_body_hash
                FROM chunks c JOIN indexed_files f ON f.id = c.file_id
           LEFT JOIN symbols s ON s.symbol_uid = c.symbol_uid
               WHERE 1=1' . $filter . '
@@ -2453,7 +2467,8 @@ final class ProjectRetriever
         $statement = $this->index->pdo()->prepare(
             'SELECT c.*, f.path, f.kind AS file_kind, f.language, f.module_vendor, f.module_name,
                     f.content_hash AS file_hash, f.revision AS file_revision, f.indexed_at,
-                    COALESCE(s.fq_name, s.name, \'\') AS symbol_name
+                    COALESCE(s.fq_name, s.name, \'\') AS symbol_name,
+                    COALESCE(s.body_hash, \'\') AS symbol_body_hash
                FROM chunks c JOIN indexed_files f ON f.id = c.file_id
           LEFT JOIN symbols s ON s.symbol_uid = c.symbol_uid
               WHERE c.chunk_id IN (' . implode(',', $placeholders) . ')'
@@ -2491,6 +2506,7 @@ final class ProjectRetriever
             'title' => $row['title'],
             'symbol_uid' => $row['symbol_uid'],
             'symbol_name' => $row['symbol_name'] ?? '',
+            'symbol_body_hash' => $row['symbol_body_hash'] ?? '',
             'start_line' => $startLine,
             'end_line' => $startLine + substr_count($snippet['text'], "\n"),
             'snippet' => $snippet['text'],
@@ -2511,22 +2527,32 @@ final class ProjectRetriever
     {
         $title = trim((string) ($item['title'] ?? ''));
         $symbol = trim((string) ($item['symbol_name'] ?? ''));
+        $symbolUid = trim((string) ($item['symbol_uid'] ?? ''));
+        $fileHash = (string) ($item['file_hash'] ?? '');
+        $expectedDigest = (string) ($item['symbol_body_hash'] ?? '');
 
-        return [
+        $region = [
             'path' => (string) ($item['relative_path'] ?? ''),
-            'file_sha256' => (string) ($item['file_hash'] ?? ''),
+            'file_sha256' => $fileHash,
+            'expected_file_sha256' => $fileHash,
             'content_sha256' => (string) ($item['content_hash'] ?? ''),
             'kind' => (string) ($item['file_kind'] ?? ''),
             'language' => (string) ($item['language'] ?? ''),
             'module' => (string) ($item['module'] ?? ''),
             'start_line' => (int) ($item['start_line'] ?? 1),
             'end_line' => (int) ($item['end_line'] ?? $item['start_line'] ?? 1),
-            'symbol_uid' => (string) ($item['symbol_uid'] ?? ''),
+            'symbol_uid' => $symbolUid,
             'symbol' => $symbol,
             'reason' => $title !== '' ? $title : ($symbol !== '' ? $symbol : $reason),
             'content' => (string) ($item['snippet'] ?? ''),
             'token_estimate' => (int) ($item['token_estimate'] ?? 0),
         ];
+        if ($symbolUid !== '' && $expectedDigest !== '') {
+            $region['target_ref'] = $symbol !== '' ? $symbol : $symbolUid;
+            $region['expected_digest'] = $expectedDigest;
+        }
+
+        return $region;
     }
 
     /** @return array{text:string,tokens:int,line_offset:int} */

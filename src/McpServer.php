@@ -122,7 +122,7 @@ final class McpServer
     private function toolResponse(string $tool, array $result, bool $isError): array
     {
         $receiptId = Ids::make('weline-mcp');
-        $mirrorBundleInContent = $tool === 'get_edit_bundle';
+        $mirrorFullResultInContent = $tool === 'get_edit_bundle' || $isError;
         $result['_weline_mcp'] = [
             'used' => true,
             'server' => self::SERVER_NAME,
@@ -133,11 +133,13 @@ final class McpServer
             'result_digest' => Ids::hash(Json::canonical($result)),
             'is_error' => $isError,
             'response_format' => 'structuredContent',
-            'legacy_content' => $mirrorBundleInContent ? 'full_bundle_mirror' : 'summary_only',
+            'legacy_content' => $mirrorFullResultInContent
+                ? ($isError ? 'full_error_mirror' : 'full_bundle_mirror')
+                : 'summary_only',
             'response_prefix' => self::RESPONSE_PREFIX,
             'report_contract' => 'Begin every subsequent user-visible progress update and the final report in this turn with the exact response_prefix.',
         ];
-        $contentPayload = $mirrorBundleInContent
+        $contentPayload = $mirrorFullResultInContent
             ? $result
             : $this->legacyToolSummary($tool, $result, $isError, $receiptId);
 

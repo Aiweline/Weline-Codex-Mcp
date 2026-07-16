@@ -768,6 +768,7 @@ final class IntelligenceService
                 $this->config,
             ))->getEditBundle($this->compactEditReplanTask($draft, $exception), [
                 'paths' => $paths,
+                'symbols' => $this->compactEditReplanSymbols($draft, $exception),
                 'max_regions' => max(1, min(20, count($paths) * 4)),
                 'max_chunks_per_file' => 4,
                 'token_budget' => 8_000,
@@ -786,6 +787,10 @@ final class IntelligenceService
                 'details' => $exception->details,
             ],
             'paths' => $paths,
+            'failed_operation' => is_array($exception->details['operation'] ?? null)
+                ? $exception->details['operation']
+                : null,
+            'requested_symbols' => $this->compactEditReplanSymbols($draft, $exception),
             'project_revision' => $index->revision(),
             'original_task' => $this->compactEditOriginalTask($draft),
             'latest_query_id' => $latestBundle['query_id'] ?? null,
@@ -808,10 +813,11 @@ final class IntelligenceService
                 'reuse_previous_operations' => false,
                 'preserve_original_requirement' => true,
                 'project_revision' => $index->revision(),
+                'guard_source' => 'Copy guards only from the latest_region matching each operation symbol_uid/target_ref/path; never use content_sha256 or an adjacent symbol digest.',
                 'next_tool' => 'apply_compact_edit',
             ],
             'file_lock' => array_merge($fileLock, ['status' => 'released_before_response']),
-            'next' => 'Discard the stale operations. Replan from latest_regions for original_task and submit a new edit-plan.v1; do not retry or patch the unchanged plan.',
+            'next' => 'Discard the stale operations. Match each old target by path plus symbol_uid/target_ref, copy expected_file_sha256 and expected_digest from that exact latest_region, then build a new edit-plan.v1 for original_task; never guess a digest or reuse the unchanged plan.',
         ];
         if ($warning !== null && $warning !== '') {
             $details['warning'] = $warning;
@@ -845,6 +851,37 @@ final class IntelligenceService
     }
 
     /** @param array<string, mixed> $draft */
+    /** @return list<string> */
+    private function compactEditReplanSymbols(array $draft, ToolException $exception): array
+    {
+        $symbols = [];
+        $failedOperation = is_array($exception->details['operation'] ?? null)
+            ? $exception->details['operation']
+            : [];
+        foreach (['symbol_uid', 'target_ref'] as $key) {
+            $value = trim((string) ($failedOperation[$key] ?? ''));
+            if ($value !== '') {
+                $symbols[] = $value;
+                break;
+            }
+        }
+
+        foreach (is_array($draft['operations'] ?? null) ? $draft['operations'] : [] as $operation) {
+            if (!is_array($operation)) {
+                continue;
+            }
+            foreach (['symbol_uid', 'target_ref'] as $key) {
+                $value = trim((string) ($operation[$key] ?? ''));
+                if ($value !== '') {
+                    $symbols[] = $value;
+                    break;
+                }
+            }
+        }
+
+        return array_slice(array_values(array_unique($symbols)), 0, 12);
+    }
+
     private function compactEditReplanTask(array $draft, ToolException $exception): string
     {
         $anchors = [];

@@ -94,7 +94,11 @@ final class EditService
             }
             $operation = $this->normalizeOperation($rawOperation);
             if (in_array($operation['kind'], ['replace_symbol', 'insert_before_symbol', 'insert_after_symbol'], true)) {
-                $symbol = $this->resolveSymbol($operation);
+                try {
+                    $symbol = $this->resolveSymbol($operation);
+                } catch (ToolException $exception) {
+                    throw $this->operationFailureException($exception, $operation, $operationIndex);
+                }
                 $operation['path'] = $symbol['path'];
                 $operation['_symbol'] = $symbol;
             }
@@ -150,8 +154,9 @@ final class EditService
                     $this->assertTargetCanRebase($operation, (string) $files[$path]['content'], $resolved);
                 }
             } catch (ToolException $exception) {
+                $failure = $this->operationFailureException($exception, $operation, $operationIndex);
                 if (!$fileHashChanged || !$allowTargetRebase) {
-                    throw $exception;
+                    throw $failure;
                 }
                 throw new ToolException(
                     'EDIT_REBASE_TARGET_CHANGED',
@@ -159,6 +164,7 @@ final class EditService
                     true,
                     [
                         'path' => $path,
+                        'operation' => $failure->details['operation'] ?? [],
                         'cause_code' => $exception->errorCode,
                         'cause_details' => $exception->details,
                         'expected_sha256' => $this->plainHash($expectedFileHash),
@@ -860,7 +866,7 @@ final class EditService
         if (is_string($expectedDigest)) {
             $operation['expected_digest'] = $expectedDigest;
         }
-        foreach (['symbol_uid', 'target_ref', 'heading', 'search'] as $key) {
+        foreach (['op_id', 'symbol_uid', 'target_ref', 'heading', 'search'] as $key) {
             $aliases = ['heading' => 'section_heading', 'search' => 'old_text'];
             $value = $raw[$key] ?? (isset($aliases[$key]) ? ($raw[$aliases[$key]] ?? null) : null);
             if (is_string($value)) {
@@ -1001,6 +1007,29 @@ final class EditService
      *  @param array{start:int,end:int,replacement:string} $range
      *  @return array<string, mixed>
      */
+    private function operationFailureException(
+        ToolException $exception,
+        array $operation,
+        int $operationIndex,
+    ): ToolException {
+        $target = ['operation_index' => $operationIndex];
+        foreach (['op_id', 'kind', 'path', 'symbol_uid', 'target_ref', 'heading'] as $key) {
+            $value = $operation[$key] ?? null;
+            if (is_string($value) && trim($value) !== '') {
+                $target[$key] = trim($value);
+            }
+        }
+        $details = $exception->details;
+        $details['operation'] = $target;
+
+        return new ToolException(
+            $exception->errorCode,
+            $exception->getMessage(),
+            $exception->retryable,
+            $details,
+        );
+    }
+
     private function publicResolvedOperation(array $operation, array $range, string $expectedFileHash): array
     {
         $result = [
@@ -1011,7 +1040,7 @@ final class EditService
             'end_byte' => $range['end'],
             'replacement' => $range['replacement'],
         ];
-        foreach (['symbol_uid', 'target_ref', 'heading', 'expected_digest', 'occurrence'] as $key) {
+        foreach (['op_id', 'symbol_uid', 'target_ref', 'heading', 'expected_digest', 'occurrence'] as $key) {
             if (array_key_exists($key, $operation)) {
                 $result[$key] = $operation[$key];
             }
