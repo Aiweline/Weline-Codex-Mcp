@@ -36,14 +36,72 @@ The runtime needs PHP 8.2+ and SQLite extensions. Startup scripts also prepare G
 - Codex CLI for the default verified-experience classifier
 - Optional `pcntl`/`posix` for short asynchronous workers
 
-## Install from source
+## One-command install (recommended)
+
+The installer downloads Weline MCP, checks and installs PHP/Git dependencies, creates the local Codex plugin, and registers the MCP automatically. Start a new Codex task after installation; no manual clone, TOML editing, or always-on service is required.
+
+### macOS / Linux
+
+GitHub:
+
+```bash
+tmp=/tmp/weline-mcp-install.sh; curl -fsSL https://raw.githubusercontent.com/Aiweline/Weline-Codex-Mcp/main/install.sh -o "$tmp" && sh "$tmp" install --source=github
+```
+
+Gitee:
+
+```bash
+tmp=/tmp/weline-mcp-install.sh; curl -fsSL https://gitee.com/aiweline/weline-codex-mcp/raw/main/install.sh -o "$tmp" && sh "$tmp" install --source=gitee
+```
+
+### Windows PowerShell
+
+GitHub:
+
+```powershell
+$p=Join-Path $env:TEMP 'weline-mcp-start.bat'; Invoke-WebRequest https://raw.githubusercontent.com/Aiweline/Weline-Codex-Mcp/main/start.bat -OutFile $p; & $p install github
+```
+
+Gitee:
+
+```powershell
+$p=Join-Path $env:TEMP 'weline-mcp-start.bat'; Invoke-WebRequest https://gitee.com/aiweline/weline-codex-mcp/raw/main/start.bat -OutFile $p; & $p install gitee
+```
+
+macOS/Linux supports Homebrew, APT, DNF/YUM, Pacman, and Zypper; Windows supports WinGet or Chocolatey. Run the command once in a normal terminal if dependency installation needs sudo or UAC.
+
+## One-command uninstall
+
+Uninstall removes the managed program, Codex plugin, and MCP registration while preserving configuration, indexes, journals, and learned data by default. Add `--purge-data` on any platform for a complete cleanup.
+
+macOS / Linux:
+
+```bash
+# GitHub
+tmp=/tmp/weline-mcp-install.sh; curl -fsSL https://raw.githubusercontent.com/Aiweline/Weline-Codex-Mcp/main/install.sh -o "$tmp" && sh "$tmp" uninstall --source=github
+# Gitee
+tmp=/tmp/weline-mcp-install.sh; curl -fsSL https://gitee.com/aiweline/weline-codex-mcp/raw/main/install.sh -o "$tmp" && sh "$tmp" uninstall --source=gitee
+```
+
+Windows PowerShell:
+
+```powershell
+# GitHub
+$p=Join-Path $env:TEMP 'weline-mcp-start.bat'; Invoke-WebRequest https://raw.githubusercontent.com/Aiweline/Weline-Codex-Mcp/main/start.bat -OutFile $p; & $p uninstall github
+# Gitee
+$p=Join-Path $env:TEMP 'weline-mcp-start.bat'; Invoke-WebRequest https://gitee.com/aiweline/weline-codex-mcp/raw/main/start.bat -OutFile $p; & $p uninstall gitee
+```
+
+## Other installation methods
+
+### Install from source
 
 GitHub:
 
 ```bash
 git clone https://github.com/Aiweline/Weline-Codex-Mcp.git
 cd Weline-Codex-Mcp
-./start.sh
+./start.sh install
 ```
 
 Gitee:
@@ -51,10 +109,10 @@ Gitee:
 ```bash
 git clone https://gitee.com/aiweline/weline-codex-mcp.git
 cd weline-codex-mcp
-./start.sh
+./start.sh install
 ```
 
-Windows uses `start.bat`. Both scripts check and, where supported, install PHP, extensions, and Git; create the user config when missing; then start the STDIO server. Diagnostics use stderr so JSON-RPC stdout stays clean.
+Windows uses `start.bat install`. Uninstall with `./start.sh uninstall` or `start.bat uninstall`; add `--purge-data` for a complete cleanup. Both scripts check and, where supported, install PHP, extensions, and Git.
 
 ## Composer
 
@@ -62,8 +120,8 @@ Available immediately through the GitHub VCS repository:
 
 ```bash
 composer global config repositories.weline-mcp vcs https://github.com/Aiweline/Weline-Codex-Mcp
-composer global require aiweline/weline-codex-mcp:^0.9
-composer global exec -- weline-mcp-install --register-codex
+composer global require aiweline/weline-codex-mcp:dev-main
+composer global exec -- weline-mcp-install install
 ```
 
 Use the Gitee URL if preferred. After Packagist publication:
@@ -72,7 +130,14 @@ Use the Gitee URL if preferred. After Packagist publication:
 composer global require aiweline/weline-codex-mcp
 ```
 
-The explicit installer preserves existing configuration and changes Codex registration only with `--register-codex`. Composer is not a runtime dependency.
+Uninstall:
+
+```bash
+composer global exec -- weline-mcp-install uninstall
+composer global remove aiweline/weline-codex-mcp
+```
+
+Use `uninstall --purge-data` in the first command for a complete cleanup. The installer preserves existing configuration; Composer is not a runtime dependency.
 
 ## Node/npm wrapper
 
@@ -91,6 +156,13 @@ codex mcp add weline -- weline-mcp
 ```
 
 The wrapper forwards stdio, arguments, environment, exit status, and signals to PHP. Set `WELINE_MCP_PHP` or `PHP_BINARY` to select PHP.
+
+Uninstall:
+
+```bash
+codex mcp remove weline
+npm uninstall -g weline-codex-mcp
+```
 
 ## Connect Codex
 
@@ -121,18 +193,9 @@ knowledge:
 
 The default config is `~/.learning-mcp/config.yaml`; Windows uses `%USERPROFILE%\.learning-mcp\config.yaml`. Relative output paths resolve under each target repository. Absolute paths work, but an external directory is not indexed with that project unless the Host loads it. Environment overrides: `LEARNING_MCP_CONFIG` and `LEARNING_MCP_SKILL_OUTPUT_DIR`.
 
-## MCP App and one-command lifecycle
+## MCP App execution panel
 
 `apply_compact_edit` and `get_edit_status` attach an MCP App report with transaction state, changed files, insertions/deletions, validation, warnings, and a bounded diff for each file. The report includes an all-changed-files review contract so Codex can audit every hunk in one read-only pass; structured/text fallbacks remain available.
-
-macOS/Linux:
-
-```bash
-tmp=/tmp/weline-mcp-install.sh; curl -fsSL https://raw.githubusercontent.com/Aiweline/Weline-Codex-Mcp/main/install.sh -o "$tmp" && sh "$tmp" install --source=github
-tmp=/tmp/weline-mcp-install.sh; curl -fsSL https://gitee.com/aiweline/weline-codex-mcp/raw/main/install.sh -o "$tmp" && sh "$tmp" install --source=gitee
-```
-
-Windows PowerShell downloads `start.bat` from the matching GitHub/Gitee raw URL and runs `cmd /c ... install github|gitee`. Uninstall from the managed directory; data is preserved unless `--purge-data` is passed.
 
 ## Recommended agent workflow
 

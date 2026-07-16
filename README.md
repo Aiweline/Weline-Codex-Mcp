@@ -120,82 +120,110 @@ Full profile 中保留的学习管理工具包括：
 ./bin/learningctl doctor --config ~/.learning-mcp/config.yaml
 ```
 
-## 安装与启动
+## 一键安装（推荐）
 
-三种发行方式使用同一套 PHP 实现和同一份配置，任选一种即可。
+安装器会自动下载 Weline MCP、检查并安装 PHP/Git 等环境依赖、生成本地 Codex 插件与 MCP 配置。安装完成后新建一个 Codex 任务即可使用，不需要手工克隆仓库、编辑 TOML 或常驻启动服务。
 
-### 方式一：源码与跨平台启动脚本
+### macOS / Linux
 
-GitHub：
+GitHub 一键安装：
+
+```bash
+tmp=/tmp/weline-mcp-install.sh; curl -fsSL https://raw.githubusercontent.com/Aiweline/Weline-Codex-Mcp/main/install.sh -o "$tmp" && sh "$tmp" install --source=github
+```
+
+国内网络可使用 Gitee：
+
+```bash
+tmp=/tmp/weline-mcp-install.sh; curl -fsSL https://gitee.com/aiweline/weline-codex-mcp/raw/main/install.sh -o "$tmp" && sh "$tmp" install --source=gitee
+```
+
+### Windows PowerShell
+
+GitHub 一键安装：
+
+```powershell
+$p=Join-Path $env:TEMP 'weline-mcp-start.bat'; Invoke-WebRequest https://raw.githubusercontent.com/Aiweline/Weline-Codex-Mcp/main/start.bat -OutFile $p; & $p install github
+```
+
+国内网络可使用 Gitee：
+
+```powershell
+$p=Join-Path $env:TEMP 'weline-mcp-start.bat'; Invoke-WebRequest https://gitee.com/aiweline/weline-codex-mcp/raw/main/start.bat -OutFile $p; & $p install gitee
+```
+
+安装脚本会把程序放到用户级托管目录，并自动安装 Codex 插件。macOS/Linux 缺少依赖时支持 Homebrew、APT、DNF/YUM、Pacman、Zypper；Windows 支持 WinGet 或 Chocolatey。需要 sudo/UAC 时，请先在普通终端执行一次安装命令。安装或升级后必须新建 Codex 任务，已有任务不会热加载新的 MCP 工具。
+
+## 一键卸载
+
+默认卸载只移除程序、Codex 插件和 MCP 注册，保留索引、Journal、配置及学习数据，方便以后重装继续使用。彻底清理时追加 `--purge-data`。
+
+macOS / Linux：
+
+```bash
+# GitHub
+tmp=/tmp/weline-mcp-install.sh; curl -fsSL https://raw.githubusercontent.com/Aiweline/Weline-Codex-Mcp/main/install.sh -o "$tmp" && sh "$tmp" uninstall --source=github
+# Gitee
+tmp=/tmp/weline-mcp-install.sh; curl -fsSL https://gitee.com/aiweline/weline-codex-mcp/raw/main/install.sh -o "$tmp" && sh "$tmp" uninstall --source=gitee
+```
+
+Windows PowerShell：
+
+```powershell
+# GitHub
+$p=Join-Path $env:TEMP 'weline-mcp-start.bat'; Invoke-WebRequest https://raw.githubusercontent.com/Aiweline/Weline-Codex-Mcp/main/start.bat -OutFile $p; & $p uninstall github
+# Gitee
+$p=Join-Path $env:TEMP 'weline-mcp-start.bat'; Invoke-WebRequest https://gitee.com/aiweline/weline-codex-mcp/raw/main/start.bat -OutFile $p; & $p uninstall gitee
+```
+
+## 其他安装方式
+
+### 源码安装
 
 ```bash
 git clone https://github.com/Aiweline/Weline-Codex-Mcp.git
 cd Weline-Codex-Mcp
-./start.sh
+./start.sh install
 ```
 
-Gitee：
+Gitee 可使用 `https://gitee.com/aiweline/weline-codex-mcp.git`，Windows 在仓库目录运行 `start.bat install`。卸载执行 `./start.sh uninstall` 或 `start.bat uninstall`；彻底清理追加 `--purge-data`。
 
-```bash
-git clone https://gitee.com/aiweline/weline-codex-mcp.git
-cd weline-codex-mcp
-./start.sh
-```
+### Composer 包
 
-Windows CMD：
-
-```bat
-git clone https://gitee.com/aiweline/weline-codex-mcp.git
-cd weline-codex-mcp
-start.bat
-```
-
-`start.sh` 与 `start.bat` 会检查 PHP 8.2+、`pdo_sqlite`、`json`、`mbstring`、`openssl` 和 Git；缺失时尝试使用 Homebrew、APT、DNF/YUM、Pacman、Zypper、WinGet 或 Chocolatey 安装。首次运行会复制示例配置到用户目录并启动 STDIO MCP。日志只写 stderr，不污染 JSON-RPC stdout。无交互 MCP Host 应先在终端运行一次，以便完成 sudo/UAC 安装。
-
-### 方式二：Composer 包
-
-Packagist 登记前可立即从 GitHub 安装：
+Packagist 发布前通过 GitHub VCS 安装：
 
 ```bash
 composer global config repositories.weline-mcp vcs https://github.com/Aiweline/Weline-Codex-Mcp
-composer global require aiweline/weline-codex-mcp:^0.9
-composer global exec -- weline-mcp-install --register-codex
+composer global require aiweline/weline-codex-mcp:dev-main
+composer global exec -- weline-mcp-install install
 ```
 
-也可把 repository URL 换成 `https://gitee.com/aiweline/weline-codex-mcp`。登记 Packagist 后可直接执行：
+也可把 VCS URL 换成 `https://gitee.com/aiweline/weline-codex-mcp`。Packagist 发布后，第一条命令可省略并直接安装正式版本。卸载：
 
 ```bash
-composer global require aiweline/weline-codex-mcp
+composer global exec -- weline-mcp-install uninstall
+composer global remove aiweline/weline-codex-mcp
 ```
 
-`weline-mcp-install` 会检查运行时、保留已有配置、缺失时创建 `~/.learning-mcp/config.yaml`，并只在显式传入 `--register-codex` 时修改 Codex MCP 配置。Composer 只负责分发，运行时不依赖 Composer。
+彻底清理时把第一条卸载命令改为 `composer global exec -- weline-mcp-install uninstall --purge-data`。Composer 只负责分发，运行时不依赖 Composer。
 
-### 方式三：Node/npm 启动壳
-
-npm Registry 发布前可直接从 Git 仓库安装：
+### Node/npm 启动壳
 
 ```bash
 npm install -g git+https://github.com/Aiweline/Weline-Codex-Mcp.git
 codex mcp add weline -- weline-mcp
 ```
 
-Gitee 源：
+Gitee 使用 `git+https://gitee.com/aiweline/weline-codex-mcp.git`；npm Registry 发布后可改为 `npm install -g weline-codex-mcp`。卸载：
 
 ```bash
-npm install -g git+https://gitee.com/aiweline/weline-codex-mcp.git
-codex mcp add weline -- weline-mcp
+codex mcp remove weline
+npm uninstall -g weline-codex-mcp
 ```
 
-发布 npm Registry 后可执行：
+Node 壳无第三方依赖，只把 stdin/stdout/stderr、参数、环境变量、退出状态和信号交给 PHP 服务；机器仍需 PHP 8.2+。可用 `WELINE_MCP_PHP` 或 `PHP_BINARY` 指定 PHP。
 
-```bash
-npm install -g weline-codex-mcp
-codex mcp add weline -- weline-mcp
-```
-
-Node 壳无第三方依赖，只把 stdin/stdout/stderr、参数、环境变量、退出状态和信号交给 `bin/learning-mcp`。它不改写协议，也不启动 HTTP 端口；机器仍需 PHP 8.2+。可用 `WELINE_MCP_PHP` 或 `PHP_BINARY` 指定 PHP。
-
-### 技能输出目录
+## 技能输出目录
 
 默认配置为 `~/.learning-mcp/config.yaml`，Windows 为 `%USERPROFILE%\.learning-mcp\config.yaml`。可用 `LEARNING_MCP_CONFIG` 指定配置文件，用 `LEARNING_MCP_SKILL_OUTPUT_DIR` 覆盖技能输出目录：
 
@@ -207,47 +235,10 @@ knowledge:
 
 留空保持原有项目级和模块级投影；相对路径按目标项目目录解析。绝对路径也支持，但项目目录外的内容不会进入该项目 SQLite 索引，需要由 MCP Host 将其作为技能目录加载。一个配置目录只能由一个项目 Manifest 管理，避免跨项目静默覆盖。
 
-## MCP App 执行面板与一键安装
+## MCP App 执行面板
 
-0.11.0 的 `get_edit_bundle`、`apply_compact_edit`、`get_run_status` 和 `get_run_trace` 绑定 `ui://weline/execution-run-v1.html`。面板以 `run_id` 展示任务约束、九个阶段、候选/选中/排除文件、精确区域、验证、自动回滚、索引版本、递归预算和逐文件有界 Diff；运行中通过宿主 `callTool` 增量刷新，终态可导出脱敏 JSON。`get_edit_status` 继续使用 v2 历史变更报告。非 MCP App 宿主仍获得相同 `structuredContent` 和文本镜像。
+0.11.0 的 `get_edit_bundle`、`apply_compact_edit`、`get_run_status` 和 `get_run_trace` 绑定 `ui://weline/execution-run-v1.html`。面板以 `run_id` 展示任务约束、九个阶段、候选/选中/排除文件、精确区域、验证、自动回滚、索引版本、递归预算和逐文件有界 Diff；阶段状态由真实事件驱动，未执行阶段不会因终态而被标成完成。`CONTEXT_INCOMPLETE` 以“上下文不足”终态展示，并直接列出完整度、缺失维度、缺失角色和原因代码；终态会自动补取追踪事件。运行中通过宿主 `callTool` 增量刷新，终态可导出脱敏 JSON。`get_edit_status` 继续使用 v2 历史变更报告。非 MCP App 宿主仍获得相同 `structuredContent` 和文本镜像。
 
-macOS / Linux 在线安装：
-
-```bash
-# GitHub
-tmp=/tmp/weline-mcp-install.sh; curl -fsSL https://raw.githubusercontent.com/Aiweline/Weline-Codex-Mcp/main/install.sh -o "$tmp" && sh "$tmp" install --source=github
-# Gitee
-tmp=/tmp/weline-mcp-install.sh; curl -fsSL https://gitee.com/aiweline/weline-codex-mcp/raw/main/install.sh -o "$tmp" && sh "$tmp" install --source=gitee
-```
-
-macOS / Linux 在线卸载：
-
-```bash
-# GitHub；默认保留索引、Journal 和学习数据
-tmp=/tmp/weline-mcp-install.sh; curl -fsSL https://raw.githubusercontent.com/Aiweline/Weline-Codex-Mcp/main/install.sh -o "$tmp" && sh "$tmp" uninstall --source=github
-# Gitee；彻底清理时追加 --purge-data
-tmp=/tmp/weline-mcp-install.sh; curl -fsSL https://gitee.com/aiweline/weline-codex-mcp/raw/main/install.sh -o "$tmp" && sh "$tmp" uninstall --source=gitee
-```
-
-Windows PowerShell 在线安装：
-
-```powershell
-# GitHub
-$p=Join-Path $env:TEMP 'weline-mcp-install.ps1'; Invoke-WebRequest https://raw.githubusercontent.com/Aiweline/Weline-Codex-Mcp/main/install.ps1 -OutFile $p; powershell -NoProfile -ExecutionPolicy Bypass -File $p -Action install -Source github
-# Gitee
-$p=Join-Path $env:TEMP 'weline-mcp-install.ps1'; Invoke-WebRequest https://gitee.com/aiweline/weline-codex-mcp/raw/main/install.ps1 -OutFile $p; powershell -NoProfile -ExecutionPolicy Bypass -File $p -Action install -Source gitee
-```
-
-Windows PowerShell 在线卸载：
-
-```powershell
-# GitHub；彻底清理时追加 -PurgeData
-$p=Join-Path $env:TEMP 'weline-mcp-install.ps1'; Invoke-WebRequest https://raw.githubusercontent.com/Aiweline/Weline-Codex-Mcp/main/install.ps1 -OutFile $p; powershell -NoProfile -ExecutionPolicy Bypass -File $p -Action uninstall -Source github
-# Gitee
-$p=Join-Path $env:TEMP 'weline-mcp-install.ps1'; Invoke-WebRequest https://gitee.com/aiweline/weline-codex-mcp/raw/main/install.ps1 -OutFile $p; powershell -NoProfile -ExecutionPolicy Bypass -File $p -Action uninstall -Source gitee
-```
-
-安装器下载到用户级托管目录、生成本地 Codex marketplace、注入 MCP 与 Hooks，并保留已有配置。`scripts/install.php install --dry-run` 只生成并校验插件，不改变 Codex 注册。安装或升级后必须新建 Codex 任务，已有任务不会热加载新的工具和 App 资源。
 ## Codex 接入与项目自动隔离
 
 独立发行版只需注册一次 MCP；之后每个任务直接以当前规范化绝对目录选择独立的索引、知识、经验与 Skill 空间；不会向上寻找 Git root，也不会合并同一 Git 仓库内的不同目录。
@@ -259,7 +250,7 @@ codex mcp add weline -- /absolute/path/to/Weline-Codex-Mcp/bin/learning-mcp --co
 codex mcp list
 ```
 
-Composer 安装运行 `weline-mcp-install --register-codex`；Node 安装注册 `weline-mcp`。Codex Desktop、Codex CLI 与 IDE Extension 在同一 Host 上共享 MCP 配置。也可在 Desktop/IDE 的 **Settings → MCP servers → Add server** 中选择 STDIO，填写命令，保存后重启客户端。
+Composer 安装运行 `weline-mcp-install install`；Node 安装注册 `weline-mcp`。Codex Desktop、Codex CLI 与 IDE Extension 在同一 Host 上共享 MCP 配置。也可在 Desktop/IDE 的 **Settings → MCP servers → Add server** 中选择 STDIO，填写命令，保存后重启客户端。
 
 手工 TOML：
 
