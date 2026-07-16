@@ -225,11 +225,16 @@ final class ProjectRetriever
         if ($task === '') {
             throw new ToolException('VALIDATION_FAILED', 'task is required');
         }
-        $requestedPaths = $this->searchPaths(['paths' => $options['paths'] ?? []]);
-        $defaultMaxRegions = $requestedPaths === [] ? 24 : min(48, max(24, count($requestedPaths) * 4));
-        $defaultTokenBudget = $requestedPaths === []
+        $materializationPaths = $this->searchPaths(['paths' => $options['paths'] ?? []]);
+        $requestedPaths = $this->searchPaths([
+            'paths' => $options['requested_paths'] ?? $materializationPaths,
+        ]);
+        $defaultMaxRegions = $materializationPaths === []
+            ? 24
+            : min(48, max(24, count($materializationPaths) * 2));
+        $defaultTokenBudget = $materializationPaths === []
             ? 8_000
-            : min(24_000, max(8_000, count($requestedPaths) * 1_200));
+            : min(24_000, max(8_000, count($materializationPaths) * 900));
         $maxRegions = max(1, min(48, (int) ($options['max_regions'] ?? $defaultMaxRegions)));
         $tokenBudget = max(256, min(24_000, (int) ($options['token_budget'] ?? $defaultTokenBudget)));
         $maxChunksPerFile = max(1, min(8, (int) ($options['max_chunks_per_file'] ?? 4)));
@@ -249,7 +254,7 @@ final class ProjectRetriever
         if ($explicitModule !== '') {
             $skillModules[] = $explicitModule;
         }
-        foreach ($requestedPaths as $requestedPath) {
+        foreach ($materializationPaths as $requestedPath) {
             $module = $this->index->moduleForPath($requestedPath);
             if (is_array($module)) {
                 $skillModules[] = (string) $module['vendor'] . '/' . (string) $module['module'];
@@ -262,10 +267,10 @@ final class ProjectRetriever
         $regionBudget = max(256, $tokenBudget - $skillReserve);
         $symbolReserve = $symbols === [] ? 0 : min((int) floor($regionBudget * 0.3), 1_200);
         $searchBudget = max(256, $regionBudget - $symbolReserve);
-        $candidateLimit = $requestedPaths === []
+        $candidateLimit = $materializationPaths === []
             ? min(96, max(48, $maxRegions * 3))
-            : min(96, max($maxRegions, count($requestedPaths) * $maxChunksPerFile));
-        $perResultDivisor = $requestedPaths === [] ? $candidateLimit : $maxRegions;
+            : min(96, max($maxRegions, count($materializationPaths) * $maxChunksPerFile));
+        $perResultDivisor = $materializationPaths === [] ? $candidateLimit : $maxRegions;
         $perRegionBudget = max(48, min(
             600,
             (int) floor($searchBudget / max(1, $perResultDivisor)),
@@ -279,7 +284,7 @@ final class ProjectRetriever
         }
         $phaseStarted = hrtime(true);
         $search = $this->search($retrievalQuery, [
-            'paths' => $requestedPaths,
+            'paths' => $materializationPaths,
             'module' => trim((string) ($options['module'] ?? '')),
             'kinds' => $kinds,
             'limit' => $candidateLimit,
@@ -296,9 +301,9 @@ final class ProjectRetriever
         $rankedResults = $this->rankEditResults(
             is_array($search['results'] ?? null) ? $search['results'] : [],
             $task,
-            $requestedPaths,
+            $materializationPaths,
         );
-        if ($requestedPaths === []) {
+        if ($materializationPaths === []) {
             foreach (array_slice($rankedResults, 0, 50) as $candidate) {
                 $candidatePath = trim((string) ($candidate['relative_path'] ?? ''));
                 if ($candidatePath === '') {
@@ -313,8 +318,28 @@ final class ProjectRetriever
             }
             $skillModules = Text::uniqueStrings($skillModules);
         }
+        // Materialize at least one exact region for every candidate path before
+        // spending the remaining bounded budget on additional chunks. This folds
+        // continuation path batches into the current MCP call.
+        $priorityResults = [];
+        $remainingResults = [];
+        $firstResultByPath = [];
         foreach ($rankedResults as $item) {
-            if (!is_array($item) || count($regions) >= $maxRegions) {
+            if (!is_array($item)) {
+                continue;
+            }
+            $candidatePath = trim((string) ($item['relative_path'] ?? $item['path'] ?? ''));
+            if ($candidatePath !== '' && !isset($firstResultByPath[$candidatePath])) {
+                $priorityResults[] = $item;
+                $firstResultByPath[$candidatePath] = true;
+                continue;
+            }
+            $remainingResults[] = $item;
+        }
+        $maxRegions = min(48, max($maxRegions, count($regions) + count($priorityResults)));
+        $rankedResults = array_merge($priorityResults, $remainingResults);
+        foreach ($rankedResults as $item) {
+            if (!is_array($item) || count($regions) >= $maxRegions || $usedTokens >= $regionBudget) {
                 continue;
             }
             $region = $this->compactRegion($item, 'hybrid_index');
@@ -491,19 +516,258 @@ final class ProjectRetriever
             $impacts,
         );
 
+        $missingPaths = [];
+        foreach ((array) ($manifest['candidate_paths'] ?? []) as $candidate) {
+            if (!is_array($candidate)
+                || !(bool) ($candidate['requested'] ?? false)
+                || (bool) ($candidate['materialized'] ?? false)) {
+                continue;
+            }
+            $path = trim((string) ($candidate['path'] ?? ''));
+            if ($path !== '') {
+                $missingPaths[] = $path;
+            }
+        }
+        $missingPaths = Text::uniqueStrings($missingPaths);
+
+        $missingSymbols = [];
+        foreach ($symbols as $requestedSymbol) {
+            $requestedSymbol = trim((string) $requestedSymbol);
+            if ($requestedSymbol === '') {
+                continue;
+            }
+            $matched = false;
+            foreach ($regions as $region) {
+                $materializedSymbol = trim((string) ($region['symbol'] ?? $region['target_ref'] ?? ''));
+                if ($materializedSymbol === $requestedSymbol
+                    || str_starts_with($materializedSymbol, $requestedSymbol . '::')
+                    || str_starts_with($requestedSymbol, $materializedSymbol . '::')) {
+                    $matched = true;
+                    break;
+                }
+            }
+            if (!$matched) {
+                $missingSymbols[] = $requestedSymbol;
+            }
+        }
+        $missingSymbols = Text::uniqueStrings($missingSymbols);
+
+        $revision = $this->index->revision();
+        if ($revision <= 0 && $regions === []) {
+            $waitStartedAt = hrtime(true);
+            do {
+                usleep(50_000);
+                $revision = $this->index->revision();
+            } while ($revision <= 0 && $this->elapsedMilliseconds($waitStartedAt) < 1_000);
+
+            throw new ToolException(
+                'INDEX_NOT_READY',
+                'Project index is not ready for an editable bundle',
+                true,
+                [
+                    'status' => 'INDEX_NOT_READY',
+                    'retryable' => true,
+                    'retry_after_ms' => 1_000,
+                    'index_revision' => $revision,
+                    'ready_for_edit' => false,
+                    'coverage_status' => 'unavailable',
+                    'continuation_needed' => false,
+                    'missing_paths' => $requestedPaths,
+                    'missing_symbols' => $symbols,
+                    'native_file_read_fallback_allowed' => false,
+                    'intermediate_user_confirmation_required' => false,
+                ],
+            );
+        }
+
+        $architecture = is_array($manifest['architecture'] ?? null) ? $manifest['architecture'] : [];
+        $expectedRoles = Text::uniqueStrings((array) ($architecture['expected_roles'] ?? []));
+        $coveredRoles = Text::uniqueStrings((array) ($architecture['covered_roles'] ?? []));
+        $missingRoles = Text::uniqueStrings((array) ($architecture['missing_roles'] ?? []));
+
+        $candidateFiles = [];
+        $selectedFiles = [];
+        $excludedFiles = [];
+        foreach ((array) ($manifest['candidate_paths'] ?? []) as $candidate) {
+            if (!is_array($candidate)) {
+                continue;
+            }
+            $path = trim((string) ($candidate['path'] ?? ''));
+            if ($path === '') {
+                continue;
+            }
+            $materialized = (bool) ($candidate['materialized'] ?? false);
+            $entry = $candidate;
+            $entry['path'] = $path;
+            $entry['materialized'] = $materialized;
+            $entry['selected'] = $materialized;
+            $entry['reasons'] = Text::uniqueStrings(array_merge(
+                (array) ($candidate['evidence'] ?? []),
+                (array) ($candidate['sources'] ?? []),
+            ), false);
+            if (!$materialized) {
+                $entry['excluded_reason'] = 'Ranked candidate was not required by the final bounded edit context.';
+            }
+            $candidateFiles[] = $entry;
+            if ($materialized) {
+                $selectedFiles[] = $entry;
+            } else {
+                $excludedFiles[] = $entry;
+            }
+        }
+
+        $expectedFileHashes = [];
+        foreach ($regions as $region) {
+            if (!is_array($region)) {
+                continue;
+            }
+            $path = trim((string) ($region['path'] ?? ''));
+            $hash = trim((string) ($region['expected_file_sha256'] ?? $region['file_sha256'] ?? ''));
+            if ($path !== '' && $hash !== '') {
+                $expectedFileHashes[$path] = $hash;
+            }
+        }
+        ksort($expectedFileHashes, SORT_STRING);
+
+        $dependencyEdges = [];
+        foreach ($impacts as $impact) {
+            if (!is_array($impact)) {
+                continue;
+            }
+            $symbol = trim((string) ($impact['symbol'] ?? ''));
+            foreach (array_slice((array) ($impact['upstream_files'] ?? []), 0, 50) as $upstreamPath) {
+                $upstreamPath = trim((string) $upstreamPath);
+                if ($upstreamPath === '') {
+                    continue;
+                }
+                $dependencyEdges[] = [
+                    'from' => $symbol,
+                    'to' => $upstreamPath,
+                    'kind' => 'upstream_consumer',
+                    'risk' => (string) ($impact['risk_level'] ?? 'unknown'),
+                ];
+            }
+        }
+
+        $hasRole = static fn (string $role): bool => in_array($role, $coveredRoles, true);
+        $needsRole = static fn (string $role): bool => in_array($role, $expectedRoles, true);
+        $dimensions = [
+            'architecture' => $missingRoles === [],
+            'definitions' => $regions !== [],
+            'requested_paths' => $missingPaths === [],
+            'requested_symbols' => $missingSymbols === [],
+            'symbol_graph' => $symbols === [] || $impacts !== [],
+            'contracts' => !$needsRole('contract') || $hasRole('contract') || $hasRole('tool_contract'),
+            'configuration' => !$needsRole('configuration') || $hasRole('configuration') || $hasRole('plugin_manifest'),
+            'tests' => !$needsRole('test') || $hasRole('test'),
+            'documentation' => !(bool) ($options['include_docs'] ?? true)
+                || !$needsRole('documentation')
+                || $hasRole('documentation'),
+            'consumers' => $symbols === [] || $dependencyEdges !== [] || $impacts !== [],
+        ];
+        $coveredDimensions = array_keys(array_filter($dimensions));
+        $missingDimensions = array_keys(array_filter($dimensions, static fn (bool $covered): bool => !$covered));
+        $readyForEdit = $revision > 0 && $missingDimensions === [];
+        $contextCompleteness = [
+            'status' => $readyForEdit ? 'complete' : 'incomplete',
+            'score' => (int) round((count($coveredDimensions) / max(1, count($dimensions))) * 100),
+            'dimensions' => $dimensions,
+            'covered' => $coveredDimensions,
+            'missing' => $missingDimensions,
+            'expected_roles' => $expectedRoles,
+            'covered_roles' => $coveredRoles,
+            'missing_roles' => $missingRoles,
+        ];
+
+        $coverage = is_array($manifest['coverage'] ?? null) ? $manifest['coverage'] : [];
+        $coverage['status'] = $readyForEdit ? 'complete' : 'partial';
+        $coverage['missing_paths'] = $missingPaths;
+        $coverage['missing_symbols'] = $missingSymbols;
+        $coverage['missing_roles'] = $missingRoles;
+        $coverage['context_score'] = $contextCompleteness['score'];
+        $initialContinuation = is_array($manifest['continuation'] ?? null)
+            ? $manifest['continuation']
+            : [];
+        $continuation = $initialContinuation;
+        $continuation['needed'] = !$readyForEdit;
+        $continuation['reason'] = $readyForEdit
+            ? 'Candidate path batches and semantic role goals were aggregated inside this call.'
+            : 'Requested indexed paths or symbols could not be materialized inside the bounded call.';
+        $continuation['next_path_batches'] = [];
+        $continuation['next_search_goals'] = [];
+        $continuation['external_followup_allowed'] = false;
+
         return [
             'request_id' => Ids::make('req'),
+            'task_id' => 'task-' . substr(hash('sha256', $this->index->projectId() . "\0" . $task), 0, 24),
+            'bundle_id' => 'bundle-' . substr(hash('sha256', $this->index->projectId() . "\0" . $revision . "\0" . $task), 0, 24),
             'query_id' => $search['query_id'] ?? '',
             'project_id' => $this->index->projectId(),
-            'index_revision' => $this->index->revision(),
+            'project_revision' => $revision,
+            'index_revision' => $revision,
             'freshness' => $this->freshness(),
             'task_digest' => Ids::hash($task),
             'task_summary' => Text::truncate($task, 160),
-            'architecture' => $manifest['architecture'],
+            'status' => $readyForEdit ? 'READY_FOR_EDIT' : 'CONTEXT_INCOMPLETE',
+            'ready_for_edit' => $readyForEdit,
+            'coverage_status' => $coverage['status'],
+            'continuation_needed' => !$readyForEdit,
+            'missing_paths' => $missingPaths,
+            'missing_symbols' => $missingSymbols,
+            'context_completeness' => $contextCompleteness,
+            'context_closure' => $dimensions + [
+                'callers_and_callees' => $dimensions['symbol_graph'],
+                'continuation_aggregated_server_side' => true,
+            ],
+            'validation_plan' => [
+                'fixed_checks_in_apply' => ['syntax', 'diff_check', 'server_approved_regression', 'targeted_reindex'],
+                'regression_entry' => 'apply_compact_edit:server_approved_batch',
+                'regression_runs_max' => 1,
+                'runtime_entry_runs_max' => 1,
+                'failure_fields' => ['failed_stage', 'evidence', 'related_regions', 'suggested_scope'],
+            ],
+            'workflow_budget' => [
+                'get_edit_bundle' => 1,
+                'successful_apply_compact_edit' => 1,
+                'conflict_replans_max' => 2,
+                'impact_expansion_depth_max' => 2,
+                'validation_repairs_max' => 2,
+                'same_error_stop_count' => 3,
+                'native_source_reads' => 0,
+                'direct_writes' => 0,
+                'intermediate_user_inquiries' => 0,
+            ],
+            'architecture' => $architecture,
+            'architecture_summary' => [
+                'phase' => $architecture['phase'] ?? ($requestedPaths === [] ? 'discovery' : 'materialization'),
+                'layer_order' => $architecture['layer_order'] ?? [],
+                'expected_roles' => $expectedRoles,
+                'covered_roles' => $coveredRoles,
+                'missing_roles' => $missingRoles,
+            ],
             'candidate_paths' => $manifest['candidate_paths'],
+            'candidate_files' => $candidateFiles,
+            'selected_files' => $selectedFiles,
+            'excluded_files' => $excludedFiles,
             'candidate_roles' => $manifest['candidate_roles'],
-            'coverage' => $manifest['coverage'],
-            'continuation' => $manifest['continuation'],
+            'exact_regions' => $regions,
+            'expected_file_hashes' => $expectedFileHashes,
+            'dependency_edges' => $dependencyEdges,
+            'impact_summary' => [
+                'risk' => $impactRisk,
+                'symbol_count' => count($impacts),
+                'dependency_edge_count' => count($dependencyEdges),
+                'consumer_file_count' => count(array_unique(array_column($dependencyEdges, 'to'))),
+            ],
+            'coverage' => $coverage,
+            'continuation' => $continuation,
+            'server_aggregation' => [
+                'bounded' => true,
+                'candidate_path_count' => count($manifest['candidate_paths'] ?? []),
+                'continuation_path_batch_count' => count($initialContinuation['next_path_batches'] ?? []),
+                'continuation_search_goal_count' => count($initialContinuation['next_search_goals'] ?? []),
+                'external_tool_round_trip_required' => false,
+            ],
             'regions' => $regions,
             'region_count' => count($regions),
             'impacts' => $impacts,
@@ -526,7 +790,7 @@ final class ProjectRetriever
                     'expected_digest',
                 ],
                 'digest_rule' => 'Use expected_digest from the exact selected symbol region; content_sha256 is only the returned snippet digest and is not a symbol guard.',
-                'replan_rule' => 'On EDIT_REPLAN_REQUIRED, discard old operations and rebuild them from matching latest_regions guards.',
+                'replan_rule' => 'On EDIT_REPLAN_REQUIRED, preserve unchanged operations and replace only failed operations from matching latest_regions guards.',
             ],
             'source' => 'project_sqlite_index',
             'selection' => $requestedPaths === []
@@ -584,7 +848,7 @@ final class ProjectRetriever
                 }
             } while ($added);
 
-            return array_merge($ordered, $unscoped);
+            return array_merge($ordered, $this->diversifyEditResults($unscoped, $task));
         }
         $lowerTask = mb_strtolower($task, 'UTF-8');
         $containsAny = static function (string $value, array $needles): bool {
@@ -835,13 +1099,16 @@ final class ProjectRetriever
         $candidateRoles = [];
         $remainingPaths = [];
         foreach ($allCandidates as $candidate) {
+            $materialized = (bool) ($candidate['materialized'] ?? false);
             foreach (is_array($candidate['roles'] ?? null) ? $candidate['roles'] : [] as $role) {
-                $coveredRoles[] = $role;
+                if ($materialized) {
+                    $coveredRoles[] = $role;
+                }
                 if (count($candidateRoles[$role] ?? []) < 50) {
                     $candidateRoles[$role][] = $candidate['path'];
                 }
             }
-            if (!(bool) ($candidate['materialized'] ?? false)) {
+            if (!$materialized) {
                 $remainingPaths[] = (string) $candidate['path'];
             }
         }
@@ -899,6 +1166,12 @@ final class ProjectRetriever
     }
 
     /** @return list<string> */
+    public function expectedContextRolesForTask(string $task): array
+    {
+        return $this->expectedContextRoles($task);
+    }
+
+    /** @return list<string> */
     private function expectedContextRoles(string $task): array
     {
         $lowerTask = mb_strtolower($task, 'UTF-8');
@@ -939,6 +1212,9 @@ final class ProjectRetriever
         if ($containsAny($lowerTask, ['文档', 'documentation', 'readme', '.md'])) {
             $add(['documentation']);
         }
+        if ($containsAny($lowerTask, ['测试', '验证', '验收', 'test', 'validation', 'regression'])) {
+            $add(['test']);
+        }
         if ($roles === []) {
             $roles[] = 'implementation';
         }
@@ -960,7 +1236,8 @@ final class ProjectRetriever
             'documentation' => 'documentation doc readme markdown',
             'tool_contract' => 'tool schema definitions inputSchema get_edit_bundle MCP',
             'retrieval' => 'retriever search rank candidate index graph',
-            'plugin_manifest' => 'plugin manifest plugin.json marketplace MCP hooks',
+            'plugin_manifest' => 'plugin manifest plugin.json marketplace MCP hooks installer install',
+            'test' => 'test tests spec fixture acceptance validation regression',
             'implementation' => 'implementation class method function',
         ];
         $selected = [];
@@ -983,9 +1260,23 @@ final class ProjectRetriever
             $roles[] = 'documentation';
         }
         if (str_contains($value, '.codex-plugin/plugin.json')
+            || str_ends_with($value, '.mcp.json')
+            || str_ends_with($value, '/plugin.json')
             || str_contains($value, 'marketplace.json')
-            || str_contains($value, '/plugins/')) {
+            || str_contains($value, '/plugins/')
+            || str_contains($value, '/scripts/install.')
+            || str_starts_with($value, 'scripts/install.')
+            || str_ends_with($value, '/install.sh')
+            || str_ends_with($value, '/install.ps1')) {
             $roles[] = 'plugin_manifest';
+        }
+        if (str_contains($value, '/tests/')
+            || str_contains($value, '/test/')
+            || str_starts_with($value, 'tests/')
+            || str_starts_with($value, 'test/')
+            || str_contains($value, '.spec.')
+            || str_contains($value, '.test.')) {
+            $roles[] = 'test';
         }
         if (str_contains($value, 'toolservice')
             || str_contains($value, 'tooldefinitions')
@@ -997,16 +1288,23 @@ final class ProjectRetriever
             || str_contains($value, '/index/')) {
             $roles[] = 'retrieval';
         }
-        if (str_contains($value, '/controller/')
+        if (str_contains($value, '/bin/')
+            || str_starts_with($value, 'bin/')
+            || str_contains($value, '/controller/')
             || str_contains($value, '/console/')
-            || str_contains($value, '/route')) {
+            || str_contains($value, '/route')
+            || str_contains($value, 'mcpserver')
+            || str_ends_with($value, '/cli.php')) {
             $roles[] = 'entrypoint';
         }
-        if (str_contains($value, '/view/')
+        if (str_contains($value, '/ui/')
+            || str_starts_with($value, 'ui/')
+            || str_contains($value, '/view/')
             || str_contains($value, '/templates/')
             || str_contains($value, '/layout/')
             || str_contains($value, '/block/')
             || str_contains($value, '/taglib/')
+            || str_contains($value, '.html')
             || str_contains($value, '.phtml')
             || str_contains($value, '.css')
             || str_contains($value, '.js')) {
@@ -2506,7 +2804,42 @@ final class ProjectRetriever
         usort($candidates, static fn (array $left, array $right): int =>
             ($right['raw'] <=> $left['raw']) ?: strcmp($left['chunk_id'], $right['chunk_id'])
         );
-        $candidates = array_slice($candidates, 0, $candidateLimit);
+        // A path-scoped bundle is a materialization request, not only a semantic
+        // ranking request. Put one indexed chunk for every exact path/scope ahead
+        // of repeat chunks from highly relevant files so a large service or doc
+        // cannot crowd a small entrypoint out of the bounded result set.
+        $rankedCandidates = $candidates;
+        $anchoredCandidates = [];
+        $anchoredChunkIds = [];
+        foreach ($requestedPaths as $scope) {
+            foreach ($rankedCandidates as $candidate) {
+                $chunkId = (string) ($candidate['chunk_id'] ?? '');
+                $row = $rows[$chunkId] ?? null;
+                if ($chunkId === '' || !is_array($row) || isset($anchoredChunkIds[$chunkId])) {
+                    continue;
+                }
+                $path = (string) ($row['path'] ?? '');
+                if ($path !== $scope && !str_starts_with($path, rtrim($scope, '/') . '/')) {
+                    continue;
+                }
+                $anchoredCandidates[] = $candidate;
+                $anchoredChunkIds[$chunkId] = true;
+                break;
+            }
+        }
+        $anchoredPathCount = count($anchoredCandidates);
+        foreach ($rankedCandidates as $candidate) {
+            if (count($anchoredCandidates) >= $candidateLimit) {
+                break;
+            }
+            $chunkId = (string) ($candidate['chunk_id'] ?? '');
+            if ($chunkId === '' || isset($anchoredChunkIds[$chunkId])) {
+                continue;
+            }
+            $anchoredCandidates[] = $candidate;
+            $anchoredChunkIds[$chunkId] = true;
+        }
+        $candidates = array_slice($anchoredCandidates, 0, $candidateLimit);
 
         $matchedScopes = 0;
         $missingScopes = [];
@@ -2543,6 +2876,7 @@ final class ProjectRetriever
                     ? 'hit'
                     : ($matchedScopes > 0 ? 'partial' : 'miss'),
                 'matched_paths' => $matchedScopes,
+                'anchored_paths' => $anchoredPathCount,
                 'materialized_chunks' => count($rows),
                 'database_round_trips' => 1,
                 'truncated' => $truncated,

@@ -69,7 +69,10 @@ final class EditService
         }
         $baseCommit = trim((string) ($draft['base_commit'] ?? ''));
         $currentCommit = $this->currentCommit();
-        if ($baseCommit === '' || !hash_equals($currentCommit, $baseCommit)) {
+        if ($baseCommit === '') {
+            $baseCommit = $currentCommit;
+        }
+        if (!hash_equals($currentCommit, $baseCommit)) {
             throw new ToolException(
                 'EDIT_COMMIT_STALE',
                 'Edit plan base commit does not match the workspace',
@@ -560,7 +563,7 @@ final class EditService
         $snapshots = $this->decodeSnapshots($row);
         $this->assertWorkspaceMatches($snapshots, 'post');
         $paths = array_column($snapshots, 'path');
-        $checks = $this->validationChecks($profile, $paths);
+        $checks = $this->validationChecks($profile, $paths, $snapshots);
         $startedAt = Clock::now();
         $results = [];
         $commands = [];
@@ -576,6 +579,21 @@ final class EditService
                     $passed = false;
                     $results[] = ['check' => 'json', 'path' => $check['path'], 'status' => 'failed', 'output' => $exception->getMessage()];
                 }
+                continue;
+            }
+            if ($check['type'] === 'diff_check') {
+                $result = $this->transactionDiffCheck($check['snapshot']);
+                $commands[] = $result['command'];
+                $checkPassed = (bool) $result['passed'];
+                $passed = $passed && $checkPassed;
+                $results[] = [
+                    'check' => 'diff_check',
+                    'path' => $check['path'] ?? null,
+                    'status' => $checkPassed ? 'passed' : 'failed',
+                    'exit_code' => $result['exit_code'],
+                    'output' => $result['output'],
+                    'duration_ms' => $result['duration_ms'],
+                ];
                 continue;
             }
             $argv = $check['argv'];
@@ -2455,6 +2473,292 @@ final class EditService
     /** @param list<array<string, mixed>> $snapshots
      *  @return list<array<string, mixed>>
      */
+    /**
+     * Build a bounded, redacted report from the sealed journal images.
+     *
+     * @param list<array<string, mixed>> $snapshots
+     * @return array<string, mixed>
+     */
+    private function changeReport(array $snapshots, string $state): array
+    {
+        $totalDiffLimit = 48_000;
+        $fileDiffLimit = 12_000;
+        $diffFileLimit = 20;
+        $remainingDiffBytes = $totalDiffLimit;
+        $insertions = 0;
+        $deletions = 0;
+        $binaryFiles = 0;
+        $unavailableFiles = 0;
+        $diffs = [];
+        $files = [];
+        $diffTruncated = false;
+
+        foreach ($snapshots as $snapshot) {
+            try {
+                $detail = $this->snapshotDiff($snapshot, $fileDiffLimit);
+            } catch (Throwable $exception) {
+                [$message] = Redactor::string($exception->getMessage());
+                $detail = [
+                    'path' => (string) ($snapshot['path'] ?? ''),
+                    'status' => ($snapshot['action'] ?? '') === 'create' ? 'created' : 'modified',
+                    'available' => false,
+                    'insertions' => null,
+                    'deletions' => null,
+                    'changed_lines' => null,
+                    'hunks' => null,
+                    'binary' => false,
+                    'diff_truncated' => false,
+                    'error' => Text::truncate($message, 500),
+                    'diff' => '',
+                ];
+            }
+
+            if ((bool) ($detail['available'] ?? false)) {
+                $insertions += (int) ($detail['insertions'] ?? 0);
+                $deletions += (int) ($detail['deletions'] ?? 0);
+                $binaryFiles += (bool) ($detail['binary'] ?? false) ? 1 : 0;
+            } else {
+                $unavailableFiles++;
+            }
+
+            $diff = (string) ($detail['diff'] ?? '');
+            $detail['diff'] = '';
+            $included = false;
+            if ($diff !== '' && count($diffs) < $diffFileLimit && $remainingDiffBytes > 0) {
+                $preview = $this->truncateDiff($diff, $remainingDiffBytes);
+                $included = $preview !== '';
+                if ($included) {
+                    $diffs[] = $preview;
+                    $detail['diff'] = $preview;
+                    $remainingDiffBytes = max(0, $remainingDiffBytes - strlen($preview));
+                }
+                if ($preview !== $diff) {
+                    $detail['diff_truncated'] = true;
+                }
+            } elseif ($diff !== '') {
+                $detail['diff_truncated'] = true;
+            }
+            $detail['diff_included'] = $included;
+            $diffTruncated = $diffTruncated || (bool) ($detail['diff_truncated'] ?? false);
+            $files[] = $detail;
+        }
+
+        $workspaceEffect = match ($state) {
+            'applied', 'applied_index_pending', 'validated' => 'applied',
+            'validation_failed' => 'applied_validation_failed',
+            'rolled_back', 'rolled_back_index_pending' => 'rolled_back',
+            'prepared' => 'preview',
+            default => 'pending_or_unknown',
+        };
+
+        return [
+            'summary' => sprintf(
+                '%d files changed, %d insertions(+), %d deletions(-)',
+                count($snapshots),
+                $insertions,
+                $deletions,
+            ),
+            'workspace_effect' => $workspaceEffect,
+            'files_changed' => count($snapshots),
+            'insertions' => $insertions,
+            'deletions' => $deletions,
+            'changed_lines' => $insertions + $deletions,
+            'binary_files' => $binaryFiles,
+            'unavailable_files' => $unavailableFiles,
+            'files' => $files,
+            'unified_diff' => implode("\n", $diffs),
+            'diff_truncated' => $diffTruncated,
+            'review_contract' => [
+                'mode' => 'all_changed_files',
+                'source' => 'sealed_preimage_postimage',
+                'changed_paths' => array_values(array_map(
+                    static fn (array $file): string => (string) ($file['path'] ?? ''),
+                    $files,
+                )),
+                'require_all_files' => true,
+                'complete' => !$diffTruncated && $unavailableFiles === 0 && $binaryFiles === 0,
+                'finding_order' => ['critical', 'high', 'medium', 'low'],
+                'finding_fields' => ['severity', 'path', 'line', 'rationale', 'suggested_fix'],
+                'no_findings' => 'State explicitly that no findings were found and identify any residual validation gaps.',
+                'follow_up' => 'If any file diff is truncated or unavailable, collect every affected path and inspect them in one bounded batch. If fixes are needed, combine all fixes into one new edit-plan.v1 transaction.',
+            ],
+            'limits' => [
+                'total_diff_bytes' => $totalDiffLimit,
+                'per_file_diff_bytes' => $fileDiffLimit,
+                'diff_files' => $diffFileLimit,
+            ],
+        ];
+    }
+
+    /**
+     * @param array<string, mixed> $snapshot
+     * @return array<string, mixed>
+     */
+    private function snapshotDiff(array $snapshot, int $previewLimit): array
+    {
+        $path = $this->safePath((string) ($snapshot['path'] ?? ''));
+        $action = (string) ($snapshot['action'] ?? 'modify');
+        $afterReference = (string) ($snapshot['after_ref'] ?? '');
+        $this->readJournal($afterReference, (string) ($snapshot['post_sha256'] ?? ''));
+
+        $temporaryBefore = null;
+        $beforeReference = (string) ($snapshot['before_ref'] ?? '');
+        if ($action === 'create') {
+            $temporaryBefore = tempnam(dirname($afterReference), '.change-report-empty-');
+            if (!is_string($temporaryBefore)) {
+                throw new RuntimeException('Unable to allocate the change report preimage');
+            }
+            $beforeReference = $temporaryBefore;
+        } else {
+            $this->readJournal($beforeReference, (string) ($snapshot['pre_sha256'] ?? ''));
+        }
+
+        $output = tempnam(dirname($afterReference), '.change-report-diff-');
+        if (!is_string($output)) {
+            if (is_string($temporaryBefore)) {
+                @unlink($temporaryBefore);
+            }
+            throw new RuntimeException('Unable to allocate the change report output');
+        }
+
+        try {
+            $pipes = [];
+            $process = proc_open(
+                [
+                    'git',
+                    '--no-pager',
+                    'diff',
+                    '--no-index',
+                    '--no-color',
+                    '--no-ext-diff',
+                    '--no-textconv',
+                    '--unified=3',
+                    '--',
+                    $beforeReference,
+                    $afterReference,
+                ],
+                [
+                    0 => ['pipe', 'r'],
+                    1 => ['file', $output, 'w'],
+                    2 => ['pipe', 'w'],
+                ],
+                $pipes,
+                $this->index->root(),
+                null,
+                ['bypass_shell' => true],
+            );
+            if (!is_resource($process)) {
+                throw new RuntimeException('Unable to start the fixed git diff command');
+            }
+            fclose($pipes[0]);
+            $error = stream_get_contents($pipes[2]);
+            fclose($pipes[2]);
+            $exitCode = proc_close($process);
+            if (!in_array($exitCode, [0, 1], true)) {
+                [$safeError] = Redactor::string(is_string($error) ? $error : '');
+                throw new RuntimeException('Fixed git diff failed: ' . Text::truncate(trim($safeError), 500));
+            }
+
+            return $this->parseSnapshotDiff($output, $path, $action, $previewLimit);
+        } finally {
+            @unlink($output);
+            if (is_string($temporaryBefore)) {
+                @unlink($temporaryBefore);
+            }
+        }
+    }
+
+    /** @return array<string, mixed> */
+    private function parseSnapshotDiff(string $output, string $path, string $action, int $previewLimit): array
+    {
+        $stream = fopen($output, 'rb');
+        if (!is_resource($stream)) {
+            throw new RuntimeException('Unable to read the fixed git diff output');
+        }
+
+        $insertions = 0;
+        $deletions = 0;
+        $hunks = 0;
+        $binary = false;
+        $collect = false;
+        $body = '';
+        $bodyTruncated = false;
+        $bodyLimit = max($previewLimit * 2, $previewLimit);
+
+        try {
+            while (($line = fgets($stream)) !== false) {
+                if (str_starts_with($line, '@@ ')) {
+                    $collect = true;
+                    $hunks++;
+                } elseif (str_starts_with($line, 'Binary files ')) {
+                    $collect = true;
+                    $binary = true;
+                    $line = 'Binary files a/' . $path . ' and b/' . $path . " differ\n";
+                }
+                if (!$collect) {
+                    continue;
+                }
+                if (!$binary && !str_starts_with($line, '@@ ')) {
+                    if (str_starts_with($line, '+')) {
+                        $insertions++;
+                    } elseif (str_starts_with($line, '-')) {
+                        $deletions++;
+                    }
+                }
+                if (strlen($body) < $bodyLimit) {
+                    $body .= $line;
+                } else {
+                    $bodyTruncated = true;
+                }
+            }
+        } finally {
+            fclose($stream);
+        }
+
+        $diff = '';
+        if ($body !== '') {
+            $header = 'diff --git a/' . $path . ' b/' . $path . "\n";
+            if (!$binary) {
+                $header .= $action === 'create'
+                    ? "--- /dev/null\n+++ b/" . $path . "\n"
+                    : '--- a/' . $path . "\n+++ b/" . $path . "\n";
+            }
+            [$diff] = Redactor::string($header . $body);
+        }
+        $preview = $this->truncateDiff($diff, $previewLimit);
+
+        return [
+            'path' => $path,
+            'status' => $action === 'create' ? 'created' : 'modified',
+            'available' => true,
+            'insertions' => $insertions,
+            'deletions' => $deletions,
+            'changed_lines' => $insertions + $deletions,
+            'hunks' => $hunks,
+            'binary' => $binary,
+            'diff_truncated' => $bodyTruncated || $preview !== $diff,
+            'error' => null,
+            'diff' => $preview,
+        ];
+    }
+
+    private function truncateDiff(string $diff, int $limit): string
+    {
+        if ($limit <= 0 || $diff === '') {
+            return '';
+        }
+        if (strlen($diff) <= $limit) {
+            return $diff;
+        }
+
+        $suffix = "\n... [diff truncated]\n";
+        $prefixLimit = max(0, $limit - strlen($suffix));
+        $prefix = function_exists('mb_strcut')
+            ? mb_strcut($diff, 0, $prefixLimit, 'UTF-8')
+            : substr($diff, 0, $prefixLimit);
+        return rtrim((string) $prefix, "\r\n") . $suffix;
+    }
+
     private function snapshotPreview(array $snapshots): array
     {
         return array_map(static fn (array $snapshot): array => [
@@ -2674,10 +2978,11 @@ final class EditService
             ['NO_COLOR' => '1'],
         );
         $commit = trim($result['stdout']);
-        if ($result['exit_code'] !== 0 || preg_match('/^[a-f0-9]{40,64}$/iD', $commit) !== 1) {
-            throw new ToolException('EDIT_COMMIT_UNAVAILABLE', 'Unable to determine the workspace HEAD commit');
+        if ($result['exit_code'] === 0 && preg_match('/^[a-f0-9]{40,64}$/iD', $commit) === 1) {
+            return $commit;
         }
-        return $commit;
+
+        return 'directory:sha256:' . hash('sha256', $this->index->root());
     }
 
     private function withProjectLock(callable $callback, string $operation = 'edit_transaction'): mixed
@@ -2760,6 +3065,7 @@ final class EditService
             'expires_at' => $row['expires_at'] ?? null,
             'applied_at' => $row['applied_at'] ?? null,
             'files' => $this->snapshotPreview($snapshotList),
+            'change_report' => $this->changeReport($snapshotList, (string) $row[$this->editStateColumn()]),
             'validations' => $validations,
             'apply_pipeline' => [
                 'strategy' => $snapshotList[0]['stage_strategy'] ?? 'not_applied',
@@ -2800,10 +3106,62 @@ final class EditService
         return $profile;
     }
 
+    /** @param array<string, mixed> $snapshot
+     *  @return array{passed: bool, exit_code: int, output: string, duration_ms: int, command: list<string>}
+     */
+    private function transactionDiffCheck(array $snapshot): array
+    {
+        $path = $this->safePath((string) ($snapshot['path'] ?? ''));
+        $action = (string) ($snapshot['action'] ?? 'modify');
+        $afterReference = (string) ($snapshot['after_ref'] ?? '');
+        $this->readJournal($afterReference, (string) ($snapshot['post_sha256'] ?? ''));
+
+        $temporaryBefore = null;
+        $beforeReference = (string) ($snapshot['before_ref'] ?? '');
+        if ($action === 'create') {
+            $temporaryBefore = tempnam(dirname($afterReference), '.validation-empty-');
+            if (!is_string($temporaryBefore)
+                || file_put_contents($temporaryBefore, '', LOCK_EX) === false) {
+                if (is_string($temporaryBefore) && is_file($temporaryBefore)) {
+                    @unlink($temporaryBefore);
+                }
+                throw new ToolException('VALIDATION_FAILED', 'Unable to allocate a fixed diff-check preimage');
+            }
+            @chmod($temporaryBefore, 0600);
+            $beforeReference = $temporaryBefore;
+        } else {
+            $this->readJournal($beforeReference, (string) ($snapshot['pre_sha256'] ?? ''));
+        }
+
+        $argv = [
+            'git', '--no-pager', 'diff', '--no-index', '--check',
+            '--no-color', '--no-ext-diff', '--no-textconv', '--',
+            $beforeReference, $afterReference,
+        ];
+        try {
+            $result = $this->runner->run($argv, $this->index->root(), '', 60, ['NO_COLOR' => '1']);
+        } finally {
+            if (is_string($temporaryBefore) && is_file($temporaryBefore)) {
+                @unlink($temporaryBefore);
+            }
+        }
+        $diagnostic = trim((string) $result['stdout'] . "\n" . (string) $result['stderr']);
+        $passed = in_array((int) $result['exit_code'], [0, 1], true) && $diagnostic === '';
+
+        return [
+            'passed' => $passed,
+            'exit_code' => (int) $result['exit_code'],
+            'output' => $passed ? '' : 'The sealed transaction diff introduces whitespace errors or the fixed diff checker failed.',
+            'duration_ms' => max(0, (int) ($result['duration_ms'] ?? 0)),
+            'command' => ['git', 'diff', '--no-index', '--check', '--', $path . ':preimage', $path . ':postimage'],
+        ];
+    }
+
     /** @param list<string> $paths
+     *  @param list<array<string, mixed>> $snapshots
      *  @return list<array<string, mixed>>
      */
-    private function validationChecks(string $profile, array $paths): array
+    private function validationChecks(string $profile, array $paths, array $snapshots): array
     {
         $checks = [];
         $all = in_array($profile, ['default', 'weline.php.module'], true);
@@ -2827,10 +3185,16 @@ final class EditService
             }
         }
         if ($all || $profile === 'diff_check') {
-            $checks[] = [
-                'type' => 'diff_check',
-                'argv' => array_merge(['git', '-C', $this->index->root(), 'diff', '--check', '--'], $paths),
-            ];
+            foreach ($snapshots as $snapshot) {
+                if (!is_array($snapshot)) {
+                    continue;
+                }
+                $checks[] = [
+                    'type' => 'diff_check',
+                    'path' => (string) ($snapshot['path'] ?? ''),
+                    'snapshot' => $snapshot,
+                ];
+            }
         }
         return $checks;
     }

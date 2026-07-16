@@ -9,7 +9,7 @@
 - `start.sh` 与 `start.bat` 可自动检查/安装 PHP、必需扩展与 Git，创建缺失配置后直接启动 STDIO MCP；安装日志与协议 stdout 隔离。
 - Codex 生命周期 Hook Collector。
 - 个人 Codex 插件启动层：自动注册 PHP MCP 与 7 个 Hook，并使用 Codex 持久化 Hook Hash trust，无需手编 TOML/Hook JSON。
-- `SessionStart` 自动解析当前 Git 项目、注入有界路由元数据，并在响应后后台首建/增量刷新该项目独立索引。
+- `SessionStart` 直接把当前规范化绝对目录作为项目、注入有界路由元数据，并在响应后后台首建/增量刷新该目录独立索引；不会向上合并到 Git root。
 - AI-facing 工具说明、插件默认 Prompt、SessionStart、UserPromptSubmit 与 bundle routing 使用同一架构优先宽批次协议：发现未知架构、批量物化候选、按累计上下文成批补齐，最终只进行一次事务写入。
 - 每个成功或失败的 MCP `tools/call` 都返回服务端 `_weline_mcp` 使用回执，并要求本轮真实调用后的用户汇报以 `Weline：` 开头；仅启动/初始化不冒充使用。
 - SQLite/WAL/FTS5 Schema、事务 Migration 和同步 Trigger。
@@ -26,7 +26,7 @@
 - `learningd once/drain/run` 和显式 macOS LaunchAgent 管理。
 - CLI 审核、Evidence 录入/挂接、Outcome、删除、Proposal 列表与 Doctor。
 - 中文无空格文本的受限本地召回回退。
-- 每项目独立 SQLite/WAL Code/Doc/Skill Index，Git file list 发现、Hash 增量、删除清理和定点刷新。
+- 每个规范化绝对目录独立 SQLite/WAL Code/Doc/Skill Index，受限文件系统目录发现、Hash 增量、删除清理和定点刷新；非 Git 目录同样可用。
 - 自动 PHP/Unix-socket Index Sidecar：无额外运行时，按项目合并 Hook 刷新、复用 SQLite 连接、15 分钟空闲退出，并保留 one-shot fallback。
 - 与 Chunk/向量同库、同事务更新的 gzip 完整文本库，以及 `get_edit_bundle` 一次接收任务/路径/符号、返回去重精确区域的紧凑读取路径。
 - Unicode61 + trigram FTS、确定性 CJK/代码词项稀疏 Feature Hash，以及 exact/module/path/symbol 混合排序。
@@ -49,7 +49,7 @@
 - 分类在后台 worker 调用隔离 Codex；模块归属由 PHP 从经验路径确定。Prompt Hook 与 `get_edit_bundle` 只读 Project SQLite 并批量注入已有技能，失败非阻断。
 - 负面 Outcome 只能创建复审 Job，不能自动降级或改写规则。
 - MCP 写入后立即定点重索引；Codex `PostToolUse` 对直接或沙箱 Node 编排内的 `apply_patch` 提取精确路径，跳过纯 Browser、严格只读和自索引工具，动态命令/终端输入/未知写入退化为整仓增量。`index.refresh_interval` 默认 60 秒，仅作为外部编辑兜底。
-- 每次 Codex `SessionStart` 后台增量校验当前 canonical Git root；项目索引使用 remote/root fingerprint 自动分库。`pcntl` 不可用时明确退化为首次索引读的同步刷新。
+- 每次 Codex `SessionStart` 后台增量校验当前规范化绝对目录；项目索引只按目录指纹自动分库，Git 元数据不参与。`pcntl` 不可用时明确退化为首次索引读的同步刷新。
 - 显式 `sync_module_knowledge mode=apply confirm=true` 可自动生成/更新 marker-owned module locator skill，但仍是一次受审批的 destructive transaction，不是后台静默写入。
 
 ## Intentionally not automatic

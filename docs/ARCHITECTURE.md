@@ -13,7 +13,7 @@
  exact/FTS/trigram/sparse/graph/content   evidence/maturity/FTS
              ^                                  ^
              | targeted refresh                 | lease/result
-       Git file catalogue                  analysis_jobs <---- learningd
+       Directory file catalogue            analysis_jobs <---- learningd
              ^                                  ^
              |                                  |
        sealed local edits                 Hooks / idle scanner /
@@ -29,7 +29,7 @@
 - `learningd`：Job Worker，负责空闲会话扫描、lease、分析、重试、死信和审计；支持 `once`、`drain`、`run`。
 - `learning-mcp`：本地 STDIO MCP Server，不监听网络端口。
 - Personal plugin：Codex Host 启动层，自动发现 `learning-mcp` 和生命周期 Hooks；MCP 本身不能在未被 Host 启动前自我注册。
-- `ProjectAutoContext`：从 Session 的 `cwd/worktree` 解析 canonical Git root，生成最多 4,000 字符的确定性路由 Context，并在 Hook stdout/数据库句柄关闭后把刷新请求交给 sidecar，不可用时再 fork 一次性子进程。
+- `ProjectAutoContext`：把 Session 的 `cwd/worktree` 规范化绝对目录直接作为项目边界，生成最多 4,000 字符的确定性路由 Context，并在 Hook stdout/数据库句柄关闭后把刷新请求交给 sidecar，不可用时再 fork 一次性子进程。
 - `IndexSidecar`：用私有 Unix socket 复用 PHP/SQLite 热状态，按项目合并 100ms 内的刷新；整仓请求覆盖定点请求，15 分钟空闲后自动退出。
 - `Scheduler`：显式管理 macOS LaunchAgent；不在安装/启动 MCP 时隐式改动系统。
 - `LearningSkillService`：从已验证项目经验构造受控分类输入，调用隔离 Codex 对 ID 分组；PHP 再按经验路径确定模块归属，在项目/模块 marker-owned 边界内渲染技能、索引之索引、事务化写入和定点重索引。
@@ -38,12 +38,18 @@
 
 模块是无 Composer 运行时依赖的 PHP 实现。`src/bootstrap.php` 以固定顺序加载类，`bin/learning-mcp`、`bin/learningctl`、`bin/learningd` 三个核心入口直接使用当前 PHP CLI。独立发行额外提供 `composer.json`、`bin/weline-mcp-install` 和无依赖的 `bin/weline-mcp.js`；它们只负责安装、注册或把 STDIO/参数/信号转交给同一 PHP Server，不形成第二套协议实现。
 
+## MCP App presentation layer
+
+The PHP STDIO server exposes a versioned `ui://weline/edit-report-v1.html` resource with `text/html;profile=mcp-app`. `apply_compact_edit` and `get_edit_status` advertise it through tool metadata and a forward-compatible output schema. The self-contained component consumes `structuredContent.change_report`, renders only the selected file's own bounded diff and hunk line numbers, exposes whether the all-files review context is complete, uses no remote assets, and keeps the text mirror for compatibility.
+
+Installers generate a user-local Codex marketplace around the current runtime/config paths. The online bootstrap owns only a marker-protected managed source directory; configuration, project indexes, journals, and learned data survive normal uninstall.
+
 ## Project intelligence flow
 
 1. 已启用插件的 Codex 新任务先启动 STDIO MCP，然后由 `SessionStart` 注入 canonical repository/index 位置和 `get_edit_bundle → apply_compact_edit` 精简路由契约。
-2. `ProjectResolver` 以 canonical Git root、remote/root fingerprint 和 HEAD 绑定项目；不同 Checkout 使用不同项目库。
+2. `ProjectResolver` 只以调用方传入的规范化绝对目录绑定项目；不向上解析 Git root，remote、branch 与 HEAD 不参与身份，同一 Git 仓库内的不同目录也使用不同项目库。
 3. `ProjectAutoContext` 返回 Hook 响应后向 `IndexSidecar` 投递刷新；Collector 会展开 Codex 的沙箱 Node 编排工具：纯 Browser/只读嵌套调用不刷新，`apply_patch` 走精确路径，动态 Shell/终端输入/未知嵌套工具保守退化为整仓 incremental。项目锁保护最终 SQLite 事务。
-4. `ProjectIndexer` 从 Git file list 发现文件，按配置排除第三方、生成产物、密钥、测试和大文件。
+4. `ProjectIndexer` 从当前项目目录的受限文件系统目录发现文件，按配置排除第三方、生成产物、密钥、测试和大文件。
 5. 只有 size/mtime/hash 变化的文件进入 Parser；删除项从 SQLite cascade 清理。
 6. PHP/PHTML 由 `token_get_all` 解析结构；Markdown 由 Heading 分块；其他文本按有界行块处理。
 7. 同一写事务更新 `indexed_files/indexed_file_contents/chunks/symbols/relations/skills`、unicode FTS、trigram FTS 和稀疏 Feature Hash。
@@ -86,7 +92,7 @@ learningd run ──poll_interval──> idle scan + claim
 
 ## Project identity
 
-项目 ID 由归一化 Git remote 与本机 repository root 指纹共同派生，以避免同名目录串库，并默认隔离不同 Checkout。远程 URL 的用户信息、查询参数和 Fragment 不入库；无 remote 时仍以本地 Root Fingerprint 工作。
+项目 ID 只由规范化绝对目录派生，前缀为 `dir:`。不同目录始终分库，包括同一 Git 仓库中的父子目录和兄弟目录；Git remote、branch、HEAD 与工作区状态都不能改变项目 ID。
 
 v1 不进行跨项目检索。`allow_cross_project` 虽保留在配置契约中，但安全校验禁止启用。
 

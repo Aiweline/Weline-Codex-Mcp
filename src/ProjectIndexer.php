@@ -66,7 +66,7 @@ final class ProjectIndexer
             $skipped = ['policy' => 0, 'missing' => 0, 'oversized' => 0, 'binary' => 0, 'unreadable' => 0];
 
             foreach ($discovered as $path) {
-                if (!$this->pathAllowed($path)) {
+                if (!$this->pathAllowed($path, $requestedPaths !== null)) {
                     ++$skipped['policy'];
                     $removed[$path] = true;
                     continue;
@@ -312,6 +312,278 @@ final class ProjectIndexer
         return $this->index(['mode' => 'incremental', 'paths' => $paths]);
     }
 
+    /**
+     * Discover a small, policy-safe set of files that can close missing architecture roles.
+     * Only paths and filenames are inspected; file contents remain behind the normal indexer.
+     *
+     * @param list<string> $roles
+     * @param list<string> $seedPaths
+     * @return list<array{path:string,roles:list<string>,score:int,reason:string}>
+     */
+    public function discoverContextPaths(array $roles, array $seedPaths = [], int $limit = 32): array
+    {
+        $supported = [
+            'entrypoint', 'view_template', 'provider_query', 'service', 'contract',
+            'configuration', 'model', 'documentation', 'tool_contract', 'retrieval',
+            'plugin_manifest', 'test', 'implementation',
+        ];
+        $roles = array_values(array_unique(array_intersect(
+            array_map(static fn (mixed $role): string => strtolower(trim((string) $role)), $roles),
+            $supported,
+        )));
+        if ($roles === []) {
+            return [];
+        }
+        $limit = max(1, min(64, $limit));
+        $includeTests = in_array('test', $roles, true);
+        $candidates = [];
+        $scanned = 0;
+        foreach ($this->contextDiscoveryRoots($seedPaths) as $rootPath) {
+            try {
+                $absoluteRoot = $rootPath === ''
+                    ? $this->index->root()
+                    : $this->index->absolutePath($rootPath);
+            } catch (Throwable) {
+                continue;
+            }
+            if (!is_dir($absoluteRoot)) {
+                continue;
+            }
+            $directories = [$rootPath];
+            while ($directories !== [] && $scanned < 20_000) {
+                $relativeDirectory = array_pop($directories);
+                $absoluteDirectory = $relativeDirectory === ''
+                    ? $this->index->root()
+                    : $this->index->absolutePath($relativeDirectory);
+                try {
+                    $iterator = new \FilesystemIterator(
+                        $absoluteDirectory,
+                        \FilesystemIterator::SKIP_DOTS | \FilesystemIterator::CURRENT_AS_FILEINFO,
+                    );
+                    foreach ($iterator as $entry) {
+                        $relativePath = ltrim($relativeDirectory . '/' . $entry->getFilename(), '/');
+                        if ($entry->isLink()) {
+                            continue;
+                        }
+                        if ($entry->isDir()) {
+                            if ($this->directoryAllowed($relativePath, $includeTests)) {
+                                $directories[] = $relativePath;
+                            }
+                            continue;
+                        }
+                        if (!$entry->isFile() || ++$scanned > 20_000) {
+                            continue;
+                        }
+                        $explicitTestPath = $includeTests
+                            && preg_match('~(?:^|/)(?:test|tests)(?:/|$)~i', $relativePath) === 1;
+                        if (!$this->pathAllowed($relativePath, $explicitTestPath)) {
+                            continue;
+                        }
+                        $pathRoles = $this->contextRolesForDiscovery($relativePath);
+                        $matchedRoles = array_values(array_intersect($roles, $pathRoles));
+                        if ($matchedRoles === []) {
+                            continue;
+                        }
+                        $candidates[$relativePath] = [
+                            'path' => $relativePath,
+                            'roles' => $matchedRoles,
+                            'score' => count($matchedRoles) * 100
+                                + $this->contextPathProximity($relativePath, $seedPaths)
+                                - substr_count($relativePath, '/'),
+                            'reason' => 'server_role_discovery:' . implode(',', $matchedRoles),
+                        ];
+                    }
+                } catch (Throwable) {
+                    continue;
+                }
+            }
+        }
+
+        $candidates = array_values($candidates);
+        usort($candidates, static fn (array $left, array $right): int =>
+            [-(int) $left['score'], (string) $left['path']]
+            <=> [-(int) $right['score'], (string) $right['path']]
+        );
+        $selected = [];
+        $selectedPaths = [];
+        for ($round = 0; $round < 2 && count($selected) < $limit; ++$round) {
+            foreach ($roles as $role) {
+                foreach ($candidates as $candidate) {
+                    $candidatePath = (string) $candidate['path'];
+                    if (isset($selectedPaths[$candidatePath])
+                        || !in_array($role, $candidate['roles'], true)) {
+                        continue;
+                    }
+                    $selected[] = $candidate;
+                    $selectedPaths[$candidatePath] = true;
+                    break;
+                }
+                if (count($selected) >= $limit) {
+                    break 2;
+                }
+            }
+        }
+        foreach ($candidates as $candidate) {
+            if (count($selected) >= $limit) {
+                break;
+            }
+            $candidatePath = (string) $candidate['path'];
+            if (isset($selectedPaths[$candidatePath])) {
+                continue;
+            }
+            $selected[] = $candidate;
+            $selectedPaths[$candidatePath] = true;
+        }
+
+        return $selected;
+    }
+
+    /** @param list<string> $seedPaths
+     *  @return list<string>
+     */
+    private function contextDiscoveryRoots(array $seedPaths): array
+    {
+        $directories = [];
+        foreach ($seedPaths as $seedPath) {
+            try {
+                $normalized = $this->index->normalizeRelativePath((string) $seedPath);
+            } catch (Throwable) {
+                continue;
+            }
+            $directory = str_replace('\\', '/', dirname($normalized));
+            $directories[] = $directory === '.' ? '' : trim($directory, '/');
+        }
+        if ($directories === []) {
+            return [''];
+        }
+        $common = explode('/', (string) $directories[0]);
+        foreach (array_slice($directories, 1) as $directory) {
+            $parts = $directory === '' ? [] : explode('/', $directory);
+            $length = min(count($common), count($parts));
+            $matched = 0;
+            while ($matched < $length && $common[$matched] === $parts[$matched]) {
+                ++$matched;
+            }
+            $common = array_slice($common, 0, $matched);
+        }
+        if (count($common) >= 4 && array_slice($common, 0, 2) === ['app', 'code']) {
+            $common = array_slice($common, 0, 4);
+        } else {
+            $leaf = strtolower((string) end($common));
+            if (in_array($leaf, [
+                'src', 'source', 'lib', 'app', 'service', 'controller', 'ui', 'view',
+                'views', 'templates', 'test', 'tests', 'doc', 'docs', 'bin', 'scripts',
+            ], true)) {
+                array_pop($common);
+            }
+        }
+
+        return [implode('/', $common)];
+    }
+
+    /** @param list<string> $seedPaths */
+    private function contextPathProximity(string $path, array $seedPaths): int
+    {
+        $pathParts = explode('/', $path);
+        $best = 0;
+        foreach ($seedPaths as $seedPath) {
+            $seedParts = explode('/', trim(str_replace('\\', '/', (string) $seedPath), '/'));
+            $matched = 0;
+            $length = min(count($pathParts), count($seedParts));
+            while ($matched < $length && $pathParts[$matched] === $seedParts[$matched]) {
+                ++$matched;
+            }
+            $best = max($best, $matched * 8);
+        }
+
+        return $best;
+    }
+
+    /** @return list<string> */
+    private function contextRolesForDiscovery(string $path): array
+    {
+        $value = strtolower(str_replace('\\', '/', $path));
+        $basename = basename($value);
+        $extension = strtolower(pathinfo($value, PATHINFO_EXTENSION));
+        $roles = [];
+        if (in_array($extension, ['md', 'markdown'], true)
+            || str_contains($value, '/doc/')
+            || str_contains($value, '/docs/')
+            || str_starts_with($basename, 'readme')) {
+            $roles[] = 'documentation';
+        }
+        if (str_contains($value, '.codex-plugin/plugin.json')
+            || str_ends_with($value, '.mcp.json')
+            || str_contains($value, 'marketplace.json')
+            || str_contains($value, '/scripts/install')
+            || str_starts_with($value, 'scripts/install')
+            || in_array($basename, ['install.sh', 'install.ps1', 'plugin.json'], true)) {
+            $roles[] = 'plugin_manifest';
+        }
+        if (preg_match('~(?:^|/)(?:test|tests)(?:/|$)~i', $value) === 1
+            || str_contains($value, '.spec.')
+            || str_contains($value, '.test.')) {
+            $roles[] = 'test';
+        }
+        if (str_contains($value, 'toolservice') || str_contains($value, 'tooldefinitions')) {
+            $roles[] = 'tool_contract';
+        }
+        if (str_contains($value, 'retriever')
+            || str_contains($value, 'indexer')
+            || str_contains($value, '/search/')) {
+            $roles[] = 'retrieval';
+        }
+        if (str_contains($value, '/bin/')
+            || str_starts_with($value, 'bin/')
+            || str_contains($value, '/controller/')
+            || str_contains($value, '/console/')
+            || in_array($basename, ['cli.php', 'mcpserver.php', 'index.php', 'console.php'], true)) {
+            $roles[] = 'entrypoint';
+        }
+        if (str_contains($value, '/ui/')
+            || str_starts_with($value, 'ui/')
+            || str_contains($value, '/view/')
+            || str_contains($value, '/templates/')
+            || str_contains($value, '/layout/')
+            || in_array($extension, ['html', 'phtml', 'css', 'js', 'jsx', 'ts', 'tsx'], true)) {
+            $roles[] = 'view_template';
+        }
+        if (str_contains($value, 'provider')
+            || str_contains($value, '/query/')
+            || str_contains($value, 'resolver')
+            || str_contains($value, 'registry')) {
+            $roles[] = 'provider_query';
+        }
+        if (str_contains($value, '/service/')
+            || str_ends_with($basename, 'service.php')
+            || str_contains($value, 'handler')
+            || str_contains($value, 'manager')) {
+            $roles[] = 'service';
+        }
+        if (str_contains($value, '/interface/')
+            || str_contains($value, '/api/')
+            || str_contains($value, 'contract')
+            || str_contains($value, '/dto/')) {
+            $roles[] = 'contract';
+        }
+        if (in_array($extension, ['json', 'yaml', 'yml', 'xml', 'toml', 'ini'], true)
+            || str_contains($value, '/etc/')
+            || str_contains($value, '/config/')
+            || in_array($basename, ['composer.json', 'package.json', 'module.php'], true)) {
+            $roles[] = 'configuration';
+        }
+        if (str_contains($value, '/model/')
+            || str_contains($value, '/entity/')
+            || str_contains($value, '/repository/')) {
+            $roles[] = 'model';
+        }
+        if ($roles === []) {
+            $roles[] = 'implementation';
+        }
+
+        return array_values(array_unique($roles));
+    }
+
     /** @param array<int, mixed> $paths
      *  @return list<string>
      */
@@ -338,82 +610,107 @@ final class ProjectIndexer
     private function discover(?array $requestedPaths): array
     {
         $paths = [];
-        $batches = $requestedPaths === null ? [null] : array_chunk($requestedPaths, 200);
-        foreach ($batches as $batch) {
-            $command = ['git', '-C', $this->index->root(), 'ls-files', '-co', '--exclude-standard', '-z'];
-            if (is_array($batch)) {
-                $command[] = '--';
-                foreach ($batch as $path) {
-                    $command[] = ':(literal)' . $path;
-                }
-            }
-            $descriptors = [
-                0 => ['file', '/dev/null', 'r'],
-                1 => ['pipe', 'w'],
-                2 => ['pipe', 'w'],
-            ];
-            // Fixed Git subcommands and argv-mode proc_open avoid shell interpretation.
-            $process = proc_open($command, $descriptors, $pipes, null, null, ['bypass_shell' => true]); // nosemgrep: php.lang.security.exec-use.exec-use
-            if (!is_resource($process)) {
-                throw new RuntimeException('Unable to start git ls-files');
-            }
-            $output = stream_get_contents($pipes[1]);
-            $error = stream_get_contents($pipes[2]);
-            fclose($pipes[1]);
-            fclose($pipes[2]);
-            $exit = proc_close($process);
-            if ($exit !== 0 || $output === false) {
-                throw new RuntimeException('git ls-files failed: ' . trim((string) $error));
-            }
-            foreach (explode("\0", $output) as $path) {
-                if ($path === '') {
+        if ($requestedPaths !== null) {
+            foreach ($requestedPaths as $path) {
+                if (!$this->pathAllowed($path, true)) {
                     continue;
                 }
-                $normalized = $this->index->normalizeRelativePath($path);
-                if ($normalized !== '') {
-                    $paths[$normalized] = true;
+                try {
+                    $absolute = $this->index->absolutePath($path);
+                } catch (Throwable) {
+                    continue;
+                }
+                if (is_file($absolute)) {
+                    $paths[$path] = true;
                 }
             }
-        }
-
-        // Exact paths are an explicit user/agent scope. Remember only eligible
-        // Git-ignored files so later whole-project refreshes retain them without
-        // broadening discovery to an ignored parent directory.
-        $rememberedPaths = $this->explicitIndexPaths();
-        $nextRemembered = array_fill_keys($rememberedPaths, true);
-        $candidates = $requestedPaths === null ? $rememberedPaths : $requestedPaths;
-        foreach ($candidates as $path) {
-            if (isset($paths[$path])) {
-                unset($nextRemembered[$path]);
-                continue;
+        } else {
+            $root = $this->index->root();
+            $directories = [''];
+            while ($directories !== []) {
+                $relativeDirectory = array_pop($directories);
+                $absoluteDirectory = $relativeDirectory === ''
+                    ? $root
+                    : $root . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $relativeDirectory);
+                try {
+                    $iterator = new \FilesystemIterator(
+                        $absoluteDirectory,
+                        \FilesystemIterator::SKIP_DOTS | \FilesystemIterator::CURRENT_AS_FILEINFO,
+                    );
+                    foreach ($iterator as $entry) {
+                        $relativePath = ltrim($relativeDirectory . '/' . $entry->getFilename(), '/');
+                        if ($entry->isLink()) {
+                            continue;
+                        }
+                        if ($entry->isDir()) {
+                            if ($this->directoryAllowed($relativePath)) {
+                                $directories[] = $relativePath;
+                            }
+                            continue;
+                        }
+                        if ($entry->isFile() && $this->pathAllowed($relativePath)) {
+                            $paths[$relativePath] = true;
+                        }
+                    }
+                } catch (Throwable) {
+                    // An unreadable directory is isolated from the rest of the project catalogue.
+                    continue;
+                }
             }
-            if (!$this->pathAllowed($path)) {
-                unset($nextRemembered[$path]);
-                continue;
-            }
-            try {
-                $absolute = $this->index->absolutePath($path);
-            } catch (Throwable) {
-                unset($nextRemembered[$path]);
-                continue;
-            }
-            if (!is_file($absolute)) {
-                unset($nextRemembered[$path]);
-                continue;
-            }
-            $paths[$path] = true;
-            $nextRemembered[$path] = true;
-        }
-        $nextRememberedPaths = array_keys($nextRemembered);
-        sort($nextRememberedPaths, SORT_STRING);
-        if ($nextRememberedPaths !== $rememberedPaths) {
-            $this->storeExplicitIndexPaths($nextRememberedPaths);
         }
 
         $result = array_keys($paths);
         sort($result, SORT_STRING);
 
         return $result;
+    }
+
+    private function directoryAllowed(string $path, bool $includeTests = false): bool
+    {
+        $path = ltrim(str_replace('\\', '/', $path), '/');
+        $lower = strtolower($path);
+        $basename = strtolower(basename($path));
+        if ($this->isSecretPath($lower, $basename)) {
+            return false;
+        }
+        if (!$includeTests
+            && !(bool) $this->config->get('index.include_tests', false)
+            && preg_match('~(?:^|/)(?:test|tests)(?:/|$)~i', $path) === 1) {
+            return false;
+        }
+        foreach ([
+            '~^\.git(?:/|$)~i',
+            '~^\.gitnexus(?:/|$)~i',
+            '~^\.codex/code-intelligence(?:/|$)~i',
+            '~(?:^|/)vendor(?:/|$)~i',
+            '~(?:^|/)node_modules(?:/|$)~i',
+            '~^generated(?:/|$)~i',
+            '~^var(?:/|$)~i',
+            '~^pub/(?:static|media)(?:/|$)~i',
+            '~(?:^|/)view/tpl(?:/|$)~i',
+            '~(?:^|/)static/libs(?:/|$)~i',
+        ] as $pattern) {
+            if (preg_match($pattern, $path) === 1) {
+                return false;
+            }
+        }
+        foreach ((array) $this->config->get('index.excluded_paths', []) as $glob) {
+            if (!is_string($glob) || trim($glob) === '') {
+                continue;
+            }
+            if (($includeTests || (bool) $this->config->get('index.include_tests', false))
+                && preg_match('/(?:^|\/)(?:test|tests)(?:\/|$)/i', $glob) === 1) {
+                continue;
+            }
+            $probe = rtrim($path, '/') . '/__weline_directory_probe__';
+            if ($this->globMatches($glob, $path)
+                || $this->globMatches($glob, $path . '/')
+                || $this->globMatches($glob, $probe)) {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     /** @return list<string> */
@@ -488,7 +785,7 @@ final class ProjectIndexer
         return $result;
     }
 
-    private function pathAllowed(string $path): bool
+    private function pathAllowed(string $path, bool $explicit = false): bool
     {
         $lower = strtolower($path);
         $basename = strtolower(basename($path));
@@ -501,8 +798,11 @@ final class ProjectIndexer
         if ($this->isRetainedKnowledgePath($path)) {
             return $this->extensionAllowed($extension);
         }
-        if (!(bool) $this->config->get('index.include_tests', false)
-            && preg_match('~(?:^|/)(?:test|tests|Test|Tests)(?:/|$)~', $path) === 1) {
+        $explicitTestPath = $explicit
+            && preg_match('~(?:^|/)(?:test|tests)(?:/|$)~i', $path) === 1;
+        if (!$explicitTestPath
+            && !(bool) $this->config->get('index.include_tests', false)
+            && preg_match('~(?:^|/)(?:test|tests)(?:/|$)~i', $path) === 1) {
             return false;
         }
         foreach ([
@@ -525,7 +825,7 @@ final class ProjectIndexer
             if (!is_string($glob)) {
                 continue;
             }
-            if ((bool) $this->config->get('index.include_tests', false)
+            if (((bool) $this->config->get('index.include_tests', false) || $explicitTestPath)
                 && preg_match('/(?:^|\/)(?:test|tests)(?:\/|$)/i', $glob) === 1) {
                 continue;
             }

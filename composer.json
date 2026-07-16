@@ -1,9 +1,9 @@
 {
   "name": "aiweline/weline-codex-mcp",
-  "description": "Local-first project intelligence, transactional batch editing, and evidence-backed Skill learning for Codex.",
+  "description": "Local-first project intelligence, transactional batch editing, durable execution runs, a live MCP App, and evidence-backed Skill learning for Codex.",
   "type": "library",
   "license": "Apache-2.0",
-  "keywords": ["codex", "mcp", "model-context-protocol", "project-intelligence", "code-index", "skill"],
+  "keywords": ["codex", "mcp", "mcp-app", "model-context-protocol", "project-intelligence", "code-index", "skill"],
   "homepage": "https://github.com/Aiweline/Weline-Codex-Mcp",
   "support": {
     "issues": "https://github.com/Aiweline/Weline-Codex-Mcp/issues",
@@ -32,7 +32,7 @@
   },
   "extra": {
     "branch-alias": {
-      "dev-main": "0.9.x-dev"
+      "dev-main": "0.11.x-dev"
     }
   }
 }

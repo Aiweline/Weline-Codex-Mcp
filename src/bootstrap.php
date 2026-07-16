@@ -15,6 +15,7 @@ require_once __DIR__ . '/ProjectRetriever.php';
 require_once __DIR__ . '/CodexInvoker.php';
 require_once __DIR__ . '/LearningNoveltyService.php';
 require_once __DIR__ . '/EditService.php';
+require_once __DIR__ . '/ExecutionRunService.php';
 require_once __DIR__ . '/KnowledgeService.php';
 require_once __DIR__ . '/LearningSkillService.php';
 require_once __DIR__ . '/IntelligenceService.php';

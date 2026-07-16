@@ -12,7 +12,7 @@ use Throwable;
 
 final class Store
 {
-    public const SCHEMA_VERSION = 1;
+    public const SCHEMA_VERSION = 2;
 
     private PDO $db;
     private string $path;
@@ -47,6 +47,12 @@ final class Store
     public function path(): string
     {
         return $this->path;
+    }
+
+    /** Internal shared connection for durable execution-run services. */
+    public function database(): PDO
+    {
+        return $this->db;
     }
 
     public function close(): void

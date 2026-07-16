@@ -14,40 +14,44 @@ final class ProjectResolver
         if (trim($cwd) === '') {
             throw new RuntimeException('cwd is required');
         }
-        $absolute = self::absolute($cwd);
-        if (!is_dir($absolute)) {
-            throw new RuntimeException('cwd is not a directory: ' . $absolute);
+        $directory = self::absolute($cwd);
+        if (!is_dir($directory)) {
+            throw new RuntimeException('cwd is not a directory: ' . $directory);
         }
-        $repository = self::git($absolute, ['rev-parse', '--show-toplevel']) ?? $absolute;
-        $repository = realpath($repository) ?: $repository;
-        $remote = self::git($repository, ['config', '--get', 'remote.origin.url']) ?? '';
-        $branch = self::git($repository, ['symbolic-ref', '--short', '-q', 'HEAD']) ?? '';
-        $head = self::git($repository, ['rev-parse', '--verify', 'HEAD']) ?? '';
-        $defaultBranch = self::git($repository, ['symbolic-ref', '--short', '-q', 'refs/remotes/origin/HEAD']) ?? '';
+
+        $identityPath = str_replace('\\', '/', $directory);
+        if (PHP_OS_FAMILY === 'Windows') {
+            $identityPath = strtolower($identityPath);
+        }
+        $rootFingerprint = Ids::hash($identityPath);
+        $projectId = 'dir:' . $rootFingerprint;
+
+        // VCS metadata remains available for diagnostics and guarded edits, but
+        // it never changes the project boundary or identity.
+        $branch = self::git($directory, ['symbolic-ref', '--short', '-q', 'HEAD']) ?? '';
+        $head = self::git($directory, ['rev-parse', '--verify', 'HEAD']) ?? '';
+        $defaultBranch = self::git($directory, ['symbolic-ref', '--short', '-q', 'refs/remotes/origin/HEAD']) ?? '';
         $defaultBranch = preg_replace('~^origin/~', '', $defaultBranch) ?? $defaultBranch;
         $dirty = false;
         if ($includeDirty) {
-            $status = self::git($repository, ['status', '--porcelain=v1', '--untracked-files=normal']);
+            $status = self::git($directory, ['status', '--porcelain=v1', '--untracked-files=normal']);
             $dirty = $status !== null && trim($status) !== '';
         }
-        $normalizedRemote = self::normalizeRemote($remote);
-        $rootFingerprint = Ids::hash($repository);
-        $remoteFingerprint = $normalizedRemote === '' ? '' : Ids::hash($normalizedRemote);
-        $projectId = 'repo:' . Ids::hash($normalizedRemote . "\n" . $rootFingerprint);
         $now = Clock::now();
 
         return [
             'project' => [
                 'id' => $projectId,
-                'name' => basename($repository),
+                'name' => basename($directory) ?: $directory,
                 'root_fingerprint' => $rootFingerprint,
-                'remote_fingerprint' => $remoteFingerprint,
+                'remote_fingerprint' => '',
                 'default_branch' => $defaultBranch,
-                'config' => [],
+                'config' => ['identity_strategy' => 'canonical_directory'],
                 'created_at' => $now,
                 'updated_at' => $now,
             ],
-            'repository' => $repository,
+            'repository' => $directory,
+            'identity_strategy' => 'canonical_directory',
             'branch' => $branch,
             'default_branch' => $defaultBranch,
             'head_commit' => $head,
@@ -65,8 +69,6 @@ final class ProjectResolver
     private static function git(string $cwd, array $arguments): ?string
     {
         $allowed = [
-            ['rev-parse', '--show-toplevel'],
-            ['config', '--get', 'remote.origin.url'],
             ['symbolic-ref', '--short', '-q', 'HEAD'],
             ['rev-parse', '--verify', 'HEAD'],
             ['symbolic-ref', '--short', '-q', 'refs/remotes/origin/HEAD'],
@@ -98,28 +100,4 @@ final class ProjectResolver
         return trim($output);
     }
 
-    private static function normalizeRemote(string $remote): string
-    {
-        $remote = trim($remote);
-        if ($remote === '') {
-            return '';
-        }
-        if (str_contains($remote, '://')) {
-            $parts = parse_url($remote);
-            if (is_array($parts) && isset($parts['host'])) {
-                $path = trim((string) ($parts['path'] ?? ''), '/');
-                $path = preg_replace('/\.git$/i', '', $path) ?? $path;
-                return strtolower($parts['host'] . '/' . $path);
-            }
-        }
-        $at = strrpos($remote, '@');
-        if ($at !== false) {
-            $remote = substr($remote, $at + 1);
-        }
-        $remote = preg_replace('/:/', '/', $remote, 1) ?? $remote;
-        $remote = trim($remote, '/');
-        $remote = preg_replace('/\.git$/i', '', $remote) ?? $remote;
-
-        return strtolower($remote);
-    }
 }

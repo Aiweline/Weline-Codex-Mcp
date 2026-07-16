@@ -35,7 +35,7 @@ final class ProjectIndex
         $project = is_array($resolved['project'] ?? null) ? $resolved['project'] : [];
         $this->projectId = trim((string) ($project['id'] ?? ''));
         if ($this->projectId === '') {
-            $this->projectId = 'repo:sha256:' . hash('sha256', $this->root);
+            $this->projectId = 'dir:sha256:' . hash('sha256', $this->root);
         }
 
         $indexRoot = rtrim($config->dataDir(), DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . 'indexes';

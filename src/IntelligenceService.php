@@ -54,6 +54,8 @@ final class IntelligenceService
             'apply_compact_edit' => $this->applyCompactEdit($input),
             'apply_edit' => $this->applyEdit($input),
             'get_edit_status' => $this->getEditStatus($input),
+            'get_run_status' => $this->getRunStatus($input),
+            'get_run_trace' => $this->getRunTrace($input),
             'validate_change' => $this->validateChange($input),
             'rollback_edit' => $this->rollbackEdit($input),
             'check_document_drift' => $this->checkDocumentDrift($input),
@@ -73,6 +75,9 @@ final class IntelligenceService
             'batch_indexed_file_read' => true,
             'compact_edit_bundle' => true,
             'compact_edit_lifecycle' => true,
+            'durable_execution_runs' => true,
+            'execution_run_schema' => 'execution-run.v1',
+            'mcp_app_live_trace' => true,
             'learning_projection_closed_loop' => true,
             'learning_projection_verification' => 'revision+file_hash+content_store+skill_metadata',
             'per_file_edit_lock_queue' => true,
@@ -375,41 +380,89 @@ final class IntelligenceService
         $task = self::required($input, 'task');
         $paths = self::strings($input['paths'] ?? []);
         $symbols = array_slice(self::strings($input['symbols'] ?? []), 0, 24);
+        $taskContract = $this->normalizeTaskContract($input, $task, $paths, $symbols);
         $defaultMaxRegions = $paths === [] ? 24 : min(48, max(24, count($paths) * 4));
         $defaultTokenBudget = $paths === [] ? 8_000 : min(24_000, max(8_000, count($paths) * 1_200));
 
         return $this->withProject(
             $input,
             true,
-            function (ProjectIndex $index) use (
+            function (ProjectIndex $index, array $resolved) use (
                 $input,
                 $task,
                 $paths,
                 $symbols,
+                $taskContract,
                 $defaultMaxRegions,
                 $defaultTokenBudget,
             ): array {
-                $onDemandIndex = $this->refreshIndexedPaths($index, $paths);
-
-                $bundle = (new ProjectRetriever(
+                $runs = new ExecutionRunService($this->learningStore, $this->config);
+                $run = $runs->begin(
+                    $index->projectId(),
+                    $task,
+                    $taskContract,
+                    $index->revision(),
+                    trim((string) ($input['supersedes_run_id'] ?? '')),
+                );
+                $runId = (string) $run['run_id'];
+                try {
+                $retriever = new ProjectRetriever(
                     $index,
                     new SparseVectorizer($this->config),
                     $this->config,
-                ))->getEditBundle($task, [
-                    'paths' => $paths,
+                );
+                $expectedRoles = $retriever->expectedContextRolesForTask($task);
+                $roleDiscoveryLimit = min(24, max(2, count($expectedRoles) * 2));
+                $roleCandidates = (new ProjectIndexer(
+                    $index,
+                    $this->config,
+                    new ProcessRunner(),
+                ))->discoverContextPaths($expectedRoles, $paths, $roleDiscoveryLimit);
+                $rolePaths = Text::uniqueStrings(array_map(
+                    static fn (array $candidate): string => (string) ($candidate['path'] ?? ''),
+                    $roleCandidates,
+                ));
+                $materializationPaths = Text::uniqueStrings(array_merge($paths, $rolePaths));
+                $onDemandIndex = $this->refreshIndexedPaths($index, $materializationPaths);
+                $effectiveMaxRegions = array_key_exists('max_regions', $input)
+                    ? max(1, min(48, (int) $input['max_regions']))
+                    : min(48, max($defaultMaxRegions, count($materializationPaths) * 2));
+                $effectiveTokenBudget = array_key_exists('token_budget', $input)
+                    ? max(256, min(24_000, (int) $input['token_budget']))
+                    : min(24_000, max($defaultTokenBudget, count($materializationPaths) * 900));
+
+                $bundle = $retriever->getEditBundle($task, [
+                    'paths' => $materializationPaths,
+                    'requested_paths' => $paths,
                     'symbols' => $symbols,
                     'module' => trim((string) ($input['module'] ?? '')),
                     'kinds' => self::strings($input['kinds'] ?? []),
-                    'max_regions' => max(1, min(48, (int) ($input['max_regions'] ?? $defaultMaxRegions))),
+                    'max_regions' => $effectiveMaxRegions,
                     'max_chunks_per_file' => max(1, min(8, (int) ($input['max_chunks_per_file'] ?? 4))),
-                    'token_budget' => max(256, min(24_000, (int) ($input['token_budget'] ?? $defaultTokenBudget))),
+                    'token_budget' => $effectiveTokenBudget,
                     'include_docs' => (bool) ($input['include_docs'] ?? true),
                     'include_skills' => (bool) ($input['include_skills'] ?? true),
                 ]);
+                $serverAggregation = is_array($bundle['server_aggregation'] ?? null)
+                    ? $bundle['server_aggregation']
+                    : [];
+                $serverAggregation['role_discovery'] = [
+                    'expected_roles' => $expectedRoles,
+                    'discovered_path_count' => count($rolePaths),
+                    'materialization_path_count' => count($materializationPaths),
+                    'paths' => $roleCandidates,
+                    'single_batch_index_refresh' => true,
+                    'external_round_trip_required' => false,
+                ];
+                $bundle['server_aggregation'] = $serverAggregation;
                 if (is_array($onDemandIndex)) {
                     $bundle['on_demand_index'] = [
-                        'mode' => 'explicit_paths_refresh',
-                        'requested_paths' => self::strings($onDemandIndex['scope_paths'] ?? $paths),
+                        'mode' => 'server_aggregated_paths_refresh',
+                        'user_requested_paths' => $paths,
+                        'role_discovered_paths' => $rolePaths,
+                        'requested_paths' => self::strings(
+                            $onDemandIndex['scope_paths'] ?? $materializationPaths,
+                        ),
                         'changed_paths' => self::strings($onDemandIndex['changed_paths'] ?? []),
                         'duration_ms' => max(0, (int) ($onDemandIndex['duration_ms'] ?? 0)),
                         'project_revision' => $index->revision(),
@@ -443,28 +496,67 @@ final class IntelligenceService
                     ],
                     'architecture_first' => true,
                     'candidate_manifest_required' => true,
-                    'context_policy' => 'Read architecture, candidate_paths, candidate_roles, coverage, and continuation before deciding from regions. Reason over all accumulated bundles before editing.',
-                    'next' => $needsFollowup
-                        ? 'Use continuation.next_path_batches as broad materialization requests and combine all continuation.next_search_goals into one discovery request. Never request one path or one role at a time.'
-                        : 'The inferred role coverage is likely complete. If the accumulated exact regions are sufficient, emit one complete edit-plan.v1 and call apply_compact_edit once.',
-                    'batch_followup_allowed' => $needsFollowup,
+                    'context_policy' => 'Use the stable ready_for_edit decision. Candidate path batches and semantic goals are aggregated by this MCP call; never compensate with native per-file reads.',
+                    'next' => (bool) ($bundle['ready_for_edit'] ?? false)
+                        ? 'Emit one complete edit-plan.v1 for all required files and call apply_compact_edit exactly once.'
+                        : 'Return the structured status and missing fields. Do not issue a follow-up bundle, use native reads, or ask the user to handle indexing.',
+                    'batch_followup_allowed' => false,
                     'followup_request' => [
-                        'path_batches' => is_array($continuation['next_path_batches'] ?? null)
-                            ? $continuation['next_path_batches']
-                            : [],
-                        'combined_search_goals' => is_array($continuation['next_search_goals'] ?? null)
-                            ? $continuation['next_search_goals']
-                            : [],
-                        'collect_symbols' => true,
+                        'path_batches' => [],
+                        'combined_search_goals' => [],
+                        'collect_symbols' => false,
                         'single_file_round_trips' => false,
                     ],
                     'scan_required' => false,
                     'whole_file_read_required' => false,
                     'native_single_file_read_allowed' => false,
-                    'write_contract' => 'Exactly one apply_compact_edit call after accumulated context is sufficient.',
+                    'intermediate_user_confirmation_required' => false,
+                    'write_contract' => 'When ready_for_edit=true, exactly one successful apply_compact_edit call is the normal path.',
+                ];
+                $bundle['task_contract'] = $taskContract;
+                $bundle['execution_contract'] = [
+                    'get_edit_bundle_call_target' => 1,
+                    'apply_compact_edit_success_call_target' => 1,
+                    'native_single_file_read_target' => 0,
+                    'intermediate_user_confirmation_target' => 0,
+                    'automatic_retry_errors' => [
+                        'INDEX_NOT_READY',
+                        'EDIT_REPLAN_REQUIRED',
+                        'VALIDATION_FAILED',
+                    ],
+                    'user_confirmation_exceptions' => [
+                        'conflicting_requirements',
+                        'missing_business_decision',
+                        'new_authority_required',
+                        'irreversible_external_operation',
+                        'host_policy_requires_approval',
+                    ],
                 ];
 
+                $bundle['repository'] = $index->root();
+                $repositorySource = (string) ($resolved['repository_source'] ?? 'argument');
+                $bundle['repository_resolution'] = [
+                    'repository' => $index->root(),
+                    'source' => $repositorySource,
+                    'inferred' => $repositorySource !== 'argument',
+                    'validated_by_known_paths' => $repositorySource === 'process_cwd_validated_by_paths',
+                ];                $bundle['task_id'] = (string) $run['task_id'];
+                $bundle['run_id'] = $runId;
+                $bundle['trace_id'] = (string) $run['trace_id'];
+                $bundle['write_contract'] = [
+                    'tool' => 'apply_compact_edit',
+                    'run_id' => $runId,
+                    'bundle_id' => (string) ($bundle['bundle_id'] ?? ''),
+                    'plan_schema' => 'edit-plan.v1',
+                    'successful_calls_target' => 1,
+                ];
+                $bundle['execution_run'] = $runs->completeBundle($runId, $index->projectId(), $bundle);
+
                 return $bundle;
+                } catch (Throwable $exception) {
+                    $runs->fail($runId, $index->projectId(), $exception, 'get_edit_bundle');
+                    throw $exception;
+                }
             },
         );
     }
@@ -582,18 +674,190 @@ final class IntelligenceService
     }
 
     /** @param array<string, mixed> $input */
+
+    /**
+     * Normalize the complete user intent into a stable contract that survives every typed retry.
+     *
+     * @param array<string, mixed> $input
+     * @param list<string> $paths
+     * @param list<string> $symbols
+     * @return array<string, mixed>
+     */
+    private function normalizeTaskContract(array $input, string $task, array $paths, array $symbols): array
+    {
+        $provided = is_array($input['task_contract'] ?? null) ? $input['task_contract'] : [];
+        $activeSkills = $provided['active_skills'] ?? $input['active_skills'] ?? null;
+        $activeSkillsDeclared = is_array($activeSkills);
+
+        return [
+            'goal' => trim((string) ($provided['goal'] ?? $input['goal'] ?? $task)),
+            'requirements' => $this->contractStringList(
+                $provided['requirements'] ?? $input['requirements'] ?? [],
+                [$task],
+            ),
+            'known_paths' => $this->contractStringList(
+                $provided['known_paths'] ?? $input['known_paths'] ?? [],
+                $paths,
+            ),
+            'known_symbols' => $this->contractStringList(
+                $provided['known_symbols'] ?? $input['known_symbols'] ?? [],
+                $symbols,
+            ),
+            'acceptance_criteria' => $this->contractStringList(
+                $provided['acceptance_criteria'] ?? $input['acceptance_criteria'] ?? [],
+            ),
+            'allowed_scope' => $this->contractStringList(
+                $provided['allowed_scope'] ?? $input['allowed_scope'] ?? [],
+                $paths !== [] ? $paths : ['current_project'],
+            ),
+            'forbidden_scope' => $this->contractStringList(
+                $provided['forbidden_scope'] ?? $input['forbidden_scope'] ?? [],
+                ['external systems', 'irreversible operations', 'unrelated projects'],
+            ),
+            'authorized_actions' => $this->contractStringList(
+                $provided['authorized_actions'] ?? $input['authorized_actions'] ?? [],
+                [
+                    'read indexed project context',
+                    'edit allowed project files',
+                    'run fixed validation',
+                    'targeted reindex',
+                    'automatic rollback on validation failure',
+                ],
+            ),
+            'assumptions' => $this->contractStringList(
+                $provided['assumptions'] ?? $input['assumptions'] ?? [],
+            ),
+            'background' => trim((string) ($provided['background'] ?? $input['background'] ?? '')),
+            'active_skills' => $activeSkillsDeclared
+                ? $this->contractStringList($activeSkills)
+                : null,
+            'active_skills_display' => $activeSkillsDeclared
+                ? 'host_supplied'
+                : '宿主未提供',
+            'instruction_sources' => $this->contractStringList(
+                $provided['instruction_sources'] ?? $input['instruction_sources'] ?? [],
+            ),
+            'validation_expectations' => $this->contractStringList(
+                $provided['validation_expectations'] ?? $input['validation_expectations'] ?? [],
+            ),
+        ];
+    }
+
+    /**
+     * @param mixed $value
+     * @param list<string> $fallback
+     * @return list<string>
+     */
+    private function contractStringList(mixed $value, array $fallback = []): array
+    {
+        $items = is_array($value) ? $value : ($value === null || $value === '' ? [] : [$value]);
+        $normalized = [];
+        foreach ($items as $item) {
+            if (!is_scalar($item)) {
+                continue;
+            }
+            $text = trim((string) $item);
+            if ($text !== '') {
+                $normalized[$text] = true;
+            }
+        }
+
+        return $normalized === [] ? array_values($fallback) : array_keys($normalized);
+    }
+
+    /**
+     * Attach the single-writer state machine and reject unclassified or exhausted recursion.
+     *
+     * @param array<string, mixed> $draft
+     * @return array<string, mixed>
+     */
+    private function normalizeClosedLoopPlan(array $draft, ProjectIndex $index): array
+    {
+        $metadata = is_array($draft['metadata'] ?? null) ? $draft['metadata'] : [];
+        $task = trim((string) ($metadata['task'] ?? 'authorized local project change'));
+        $revision = (int) ($draft['project_revision'] ?? $index->revision());
+        $reason = strtoupper(trim((string) ($metadata['recursion_reason'] ?? 'NORMAL')));
+        $allowed = ['NORMAL', 'CONFLICT_REPLAN', 'IMPACT_EXPANSION', 'VALIDATION_REPAIR', 'USER_SCOPE_CHANGE'];
+        if (!in_array($reason, $allowed, true)) {
+            throw new ToolException(
+                'WORKFLOW_RECURSION_UNCLASSIFIED',
+                'A repeated edit must use a typed closed-loop recursion reason',
+                false,
+                ['allowed_reasons' => $allowed, 'received' => $reason],
+            );
+        }
+
+        $counts = is_array($metadata['recursion_counts'] ?? null) ? $metadata['recursion_counts'] : [];
+        $limits = [
+            'CONFLICT_REPLAN' => 2,
+            'IMPACT_EXPANSION' => 2,
+            'VALIDATION_REPAIR' => 2,
+            'USER_SCOPE_CHANGE' => 1,
+        ];
+        $count = max(0, (int) ($counts[$reason] ?? 0));
+        if ($reason !== 'NORMAL' && $count > ($limits[$reason] ?? 0)) {
+            throw new ToolException(
+                'WORKFLOW_RETRY_BUDGET_EXCEEDED',
+                'The typed recursion budget is exhausted',
+                false,
+                ['reason' => $reason, 'count' => $count, 'limit' => $limits[$reason] ?? 0],
+            );
+        }
+        $sameErrorCount = max(0, (int) ($metadata['same_error_count'] ?? 0));
+        if ($sameErrorCount >= 3) {
+            throw new ToolException(
+                'WORKFLOW_REPEATED_FAILURE',
+                'The same workflow error occurred three times; automatic recursion stopped',
+                false,
+                ['same_error_count' => $sameErrorCount, 'reason' => $reason],
+            );
+        }
+
+        $metadata['task'] = $task;
+        $metadata['task_id'] = trim((string) ($metadata['task_id'] ?? ''))
+            ?: 'task-' . substr(hash('sha256', $index->projectId() . "\0" . $task), 0, 24);
+        $metadata['bundle_id'] = trim((string) ($metadata['bundle_id'] ?? ''))
+            ?: 'bundle-' . substr(hash('sha256', $index->projectId() . "\0" . $revision . "\0" . $task), 0, 24);
+        $metadata['recursion_reason'] = $reason;
+        $metadata['recursion_counts'] = $counts;
+        $metadata['same_error_count'] = $sameErrorCount;
+        $metadata['writer_mode'] = 'single_writer';
+        $metadata['subagents_allowed'] = false;
+        $metadata['workflow_limits'] = [
+            'conflict_replans' => 2,
+            'impact_expansion_depth' => 2,
+            'validation_repairs' => 2,
+            'same_error_stop_count' => 3,
+        ];
+        $metadata['validation_plan'] = is_array($metadata['validation_plan'] ?? null)
+            ? $metadata['validation_plan']
+            : [
+                'fixed_checks_in_apply' => ['syntax', 'diff_check', 'targeted_reindex'],
+                'regression_entry' => 'validate_change',
+                'regression_runs_max' => 1,
+                'runtime_entry_runs_max' => 1,
+            ];
+        $draft['metadata'] = $metadata;
+
+        return $draft;
+    }
+
     private function applyCompactEdit(array $input): array
     {
         $this->requireEditingEnabled();
         if (!is_array($input['plan'] ?? null)) {
             throw new ToolException('VALIDATION_FAILED', 'plan is required');
         }
+        $runId = self::required($input, 'run_id');
+        $bundleId = self::required($input, 'bundle_id');
         $operationCount = count(is_array($input['plan']['operations'] ?? null) ? $input['plan']['operations'] : []);
         if ($operationCount < 1 || $operationCount > 50) {
             throw new ToolException('EDIT_BUDGET_EXCEEDED', 'A compact edit requires between 1 and 50 operations');
         }
 
-        return $this->withProject($input, true, function (ProjectIndex $index, array $resolved) use ($input): array {
+        return $this->withProject($input, true, function (ProjectIndex $index, array $resolved) use ($input, $runId, $bundleId): array {
+            $runs = new ExecutionRunService($this->learningStore, $this->config);
+            try {
             $totalStartedAt = hrtime(true);
             $timingMs = [
                 'lock_wait' => 0,
@@ -601,6 +865,7 @@ final class IntelligenceService
                 'prepare' => 0,
                 'apply' => 0,
                 'validate' => 0,
+                'regression' => 0,
                 'index' => 0,
                 'knowledge' => 0,
                 'total' => 0,
@@ -611,6 +876,21 @@ final class IntelligenceService
             $draft['base_commit'] = (string) ($draft['base_commit'] ?? $resolved['head_commit']);
             $submittedRevision = (int) ($draft['project_revision'] ?? $draft['index_revision'] ?? $index->revision());
             $draft['project_revision'] = $submittedRevision;
+            $metadata = is_array($draft['metadata'] ?? null) ? $draft['metadata'] : [];
+            foreach (['run_id' => $runId, 'bundle_id' => $bundleId] as $key => $expected) {
+                $provided = trim((string) ($metadata[$key] ?? ''));
+                if ($provided !== '' && !hash_equals($expected, $provided)) {
+                    throw new ToolException('RUN_BUNDLE_MISMATCH', 'Plan metadata does not match the apply request', false, [
+                        'field' => $key,
+                        'expected' => $expected,
+                        'received' => $provided,
+                    ]);
+                }
+                $metadata[$key] = $expected;
+            }
+            $draft['metadata'] = $metadata;
+            $draft = $this->normalizeClosedLoopPlan($draft, $index);
+            $runs->beginApply($runId, $index->projectId(), $draft);
             $service = $this->editService($index);
             $recovery = $service->recoverInterruptedTransactions();
             if ((bool) ($recovery['requires_attention'] ?? false)
@@ -626,7 +906,7 @@ final class IntelligenceService
                 );
             }
 
-            return $service->withPlanFileLocks($draft, function (array $fileLock) use (
+            $result = $service->withPlanFileLocks($draft, function (array $fileLock) use (
                 $index,
                 $input,
                 $service,
@@ -683,9 +963,13 @@ final class IntelligenceService
                         'profile' => (string) ($draft['validation_profile'] ?? 'default'),
                     ]);
                     $timingMs['validate'] = self::elapsedMilliseconds($validateStartedAt);
+                    $regressionStartedAt = hrtime(true);
+                    $regressionValidation = $this->runRegressionValidation($index, $paths);
+                    $timingMs['regression'] = self::elapsedMilliseconds($regressionStartedAt);
                     $rolledBack = null;
-                    $rollbackOnFailure = (bool) ($input['rollback_on_validation_failure'] ?? true);
-                    if (($validation['status'] ?? '') !== 'passed' && $rollbackOnFailure) {
+                    $validationPassed = ($validation['status'] ?? '') === 'passed'
+                        && ($regressionValidation['status'] ?? '') !== 'failed';
+                    if (!$validationPassed) {
                         $rolledBack = $service->rollback($editId);
                     }
                     $indexRefresh = is_array($rolledBack)
@@ -704,6 +988,7 @@ final class IntelligenceService
                             'recovery' => 'Retry index_project in incremental mode; its durable index path also reconciles module knowledge.',
                         ];
                     $timingMs['knowledge'] = self::elapsedMilliseconds($knowledgeStartedAt);
+                    $finalStatus = $service->status($editId);
 
                     $checks = [];
                     foreach (is_array($validation['results'] ?? null) ? $validation['results'] : [] as $result) {
@@ -723,8 +1008,13 @@ final class IntelligenceService
                     return [
                         'request_id' => Ids::make('req'),
                         'edit_id' => $editId,
-                        'state' => is_array($rolledBack) ? ($rolledBack['state'] ?? 'rolled_back') : ($validation['status'] === 'passed' ? 'validated' : 'validation_failed'),
+                        'state' => $finalStatus['state'] ?? (is_array($rolledBack) ? ($rolledBack['state'] ?? 'rolled_back') : ($validation['status'] === 'passed' ? 'validated' : 'validation_failed')),
                         'paths' => $paths,
+                        'base_commit' => (string) ($finalStatus['base_commit'] ?? $prepared['base_commit'] ?? ''),
+                        'files' => is_array($finalStatus['files'] ?? null) ? $finalStatus['files'] : [],
+                        'change_report' => is_array($finalStatus['change_report'] ?? null) ? $finalStatus['change_report'] : [],
+                        'apply_pipeline' => is_array($finalStatus['apply_pipeline'] ?? null) ? $finalStatus['apply_pipeline'] : [],
+                        'impact_delta' => $this->compactEditImpactDelta($index, $draft, $paths),
                         'rebased_files' => is_array($prepared['rebased_files'] ?? null) ? $prepared['rebased_files'] : [],
                         'target_refresh' => [
                             'mode' => 'locked_preflight',
@@ -739,6 +1029,7 @@ final class IntelligenceService
                             'status' => $validation['status'] ?? 'unknown',
                             'checks' => $checks,
                         ],
+                        'regression_validation' => $regressionValidation,
                         'index_revision' => $index->revision(),
                         'index_refreshed' => $indexRefreshed,
                         'knowledge_state' => [
@@ -759,7 +1050,64 @@ final class IntelligenceService
                     throw $this->compactEditReplanException($index, $draft, $exception, $fileLock);
                 }
             });
+            $result['run_id'] = $runId;
+            $result['bundle_id'] = $bundleId;
+            $result['execution_run'] = $runs->completeApply($runId, $index->projectId(), $result);
+
+            return $result;
+            } catch (Throwable $exception) {
+                $runs->fail($runId, $index->projectId(), $exception);
+                throw $exception;
+            }
         });
+    }
+
+    /**
+     * Run a fixed, argv-only regression adapter selected exclusively by changed paths.
+     *
+     * @param list<string> $paths
+     * @return array<string,mixed>
+     */
+    private function runRegressionValidation(ProjectIndex $index, array $paths): array
+    {
+        $matchesMcp = false;
+        foreach ($paths as $path) {
+            if (str_starts_with($path, 'dev/ai/mcp/')) {
+                $matchesMcp = true;
+                break;
+            }
+        }
+        $runner = $index->root() . DIRECTORY_SEPARATOR . 'dev/ai/mcp/tests/run.php';
+        if (!$matchesMcp || !is_file($runner)) {
+            return [
+                'status' => 'skipped',
+                'profile' => 'none',
+                'reason' => $matchesMcp
+                    ? 'The Weline MCP fixed regression runner is not present.'
+                    : 'No server-approved regression adapter matched the changed paths.',
+            ];
+        }
+
+        $result = (new ProcessRunner())->run(
+            [PHP_BINARY, $runner, '--quick'],
+            $index->root(),
+            '',
+            120,
+            ['WELINE_MCP_TEST_MODE' => 'validation'],
+        );
+        [$stdout] = Redactor::string((string) ($result['stdout'] ?? ''));
+        [$stderr] = Redactor::string((string) ($result['stderr'] ?? ''));
+
+        return [
+            'status' => (int) ($result['exit_code'] ?? 1) === 0 && !(bool) ($result['timed_out'] ?? false)
+                ? 'passed'
+                : 'failed',
+            'profile' => 'weline_mcp_quick',
+            'exit_code' => (int) ($result['exit_code'] ?? 1),
+            'timed_out' => (bool) ($result['timed_out'] ?? false),
+            'duration_ms' => max(0, (int) ($result['duration_ms'] ?? 0)),
+            'output' => Text::truncate(trim($stdout . "\n" . $stderr), 4_000),
+        ];
     }
 
     private function compactEditNeedsReplan(ToolException $exception): bool
@@ -823,6 +1171,7 @@ final class IntelligenceService
             $warning = trim(($warning === null ? '' : $warning . ' ') . 'Latest-region retrieval failed: ' . Text::truncate($message, 500));
         }
 
+        $operationPartition = $this->compactEditOperationPartition($draft, $exception);
         $details = [
             'cause' => [
                 'code' => $exception->errorCode,
@@ -830,9 +1179,24 @@ final class IntelligenceService
                 'details' => $exception->details,
             ],
             'paths' => $paths,
+            'project_id' => $index->projectId(),
+            'task_id' => (string) ($draft['metadata']['task_id'] ?? ''),
+            'bundle_id' => (string) ($draft['metadata']['bundle_id'] ?? ''),
             'failed_operation' => is_array($exception->details['operation'] ?? null)
                 ? $exception->details['operation']
                 : null,
+            'failed_operations' => $operationPartition['failed_operations'],
+            'unchanged_operations' => $operationPartition['unchanged_operations'],
+            'semantic_diff_from_bundle' => [
+                'cause_code' => $exception->errorCode,
+                'changed_paths' => is_array($targetRefresh)
+                    ? self::strings($targetRefresh['changed_paths'] ?? [])
+                    : [],
+                'latest_region_count' => is_array($latestBundle['regions'] ?? null)
+                    ? count($latestBundle['regions'])
+                    : 0,
+                'latest_query_id' => $latestBundle['query_id'] ?? null,
+            ],
             'requested_symbols' => $this->compactEditReplanSymbols($draft, $exception),
             'project_revision' => $index->revision(),
             'original_task' => $this->compactEditOriginalTask($draft),
@@ -853,14 +1217,19 @@ final class IntelligenceService
             'retry_contract' => [
                 'plan_schema' => 'edit-plan.v1',
                 'new_plan_required' => true,
-                'reuse_previous_operations' => false,
+                'reuse_previous_operations' => true,
+                'preserve_unchanged_operations' => true,
+                'replace_only_failed_operations' => true,
+                'recursion_reason' => 'CONFLICT_REPLAN',
+                'max_replans' => 2,
+                'same_conflict_stop_count' => 3,
                 'preserve_original_requirement' => true,
                 'project_revision' => $index->revision(),
                 'guard_source' => 'Copy guards only from the latest_region matching each operation symbol_uid/target_ref/path; never use content_sha256 or an adjacent symbol digest.',
                 'next_tool' => 'apply_compact_edit',
             ],
             'file_lock' => array_merge($fileLock, ['status' => 'released_before_response']),
-            'next' => 'Discard the stale operations. Match each old target by path plus symbol_uid/target_ref, copy expected_file_sha256 and expected_digest from that exact latest_region, then build a new edit-plan.v1 for original_task; never guess a digest or reuse the unchanged plan.',
+            'next' => 'Keep every unchanged operation. Replace only failed operations by matching path plus symbol_uid/target_ref against latest_regions, classify the retry as CONFLICT_REPLAN, and preserve original_task; never guess a digest.',
         ];
         if ($warning !== null && $warning !== '') {
             $details['warning'] = $warning;
@@ -872,6 +1241,170 @@ final class IntelligenceService
             true,
             $details,
         );
+    }
+
+    /**
+     * Split the submitted plan at the exact failed operation so callers can retain all safe work.
+     *
+     * @param array<string, mixed> $draft
+     * @return array{failed_operations:list<array<string,mixed>>,unchanged_operations:list<array<string,mixed>>}
+     */
+    private function compactEditOperationPartition(array $draft, ToolException $exception): array
+    {
+        $failedDescriptor = is_array($exception->details['operation'] ?? null)
+            ? $exception->details['operation']
+            : [];
+        $failedIndex = isset($failedDescriptor['operation_index'])
+            ? (int) $failedDescriptor['operation_index']
+            : -1;
+        $failedId = trim((string) ($failedDescriptor['op_id'] ?? ''));
+        $failed = [];
+        $unchanged = [];
+
+        foreach (is_array($draft['operations'] ?? null) ? $draft['operations'] : [] as $index => $operation) {
+            if (!is_array($operation)) {
+                continue;
+            }
+            $operation['operation_index'] = (int) $index;
+            $operationId = trim((string) ($operation['op_id'] ?? ''));
+            $matches = $failedIndex === (int) $index
+                || ($failedId !== '' && $operationId !== '' && hash_equals($failedId, $operationId));
+            if ($matches) {
+                $failed[] = $operation;
+                continue;
+            }
+            $unchanged[] = $operation;
+        }
+
+        return [
+            'failed_operations' => $failed,
+            'unchanged_operations' => $unchanged,
+        ];
+    }
+
+    /**
+     * Calculate post-apply consumers from the refreshed index without another model/tool round trip.
+     *
+     * @param array<string, mixed> $draft
+     * @param list<string> $paths
+     * @return array<string, mixed>
+     */
+    private function compactEditImpactDelta(ProjectIndex $index, array $draft, array $paths): array
+    {
+        $metadata = is_array($draft['metadata'] ?? null) ? $draft['metadata'] : [];
+        $counts = is_array($metadata['recursion_counts'] ?? null) ? $metadata['recursion_counts'] : [];
+        $depth = max(0, (int) ($counts['IMPACT_EXPANSION'] ?? 0));
+        $symbols = [];
+        foreach (is_array($draft['operations'] ?? null) ? $draft['operations'] : [] as $operation) {
+            if (!is_array($operation)) {
+                continue;
+            }
+            foreach (['symbol_uid', 'target_ref'] as $key) {
+                $symbol = trim((string) ($operation[$key] ?? ''));
+                if ($symbol !== '') {
+                    $symbols[$symbol] = true;
+                    break;
+                }
+            }
+        }
+
+        $knownPaths = array_fill_keys($paths, true);
+        $taskContract = is_array($metadata['task_contract'] ?? null) ? $metadata['task_contract'] : [];
+        foreach (self::strings($taskContract['known_paths'] ?? []) as $path) {
+            $knownPaths[$path] = true;
+        }
+
+        try {
+            $bundle = (new ProjectRetriever(
+                $index,
+                new SparseVectorizer($this->config),
+                $this->config,
+            ))->getEditBundle(
+                'Post-apply indexed impact closure for ' . $this->compactEditOriginalTask($draft),
+                [
+                    'paths' => $paths,
+                    'symbols' => array_keys($symbols),
+                    'max_regions' => max(1, min(48, count($paths) * 3)),
+                    'max_chunks_per_file' => 3,
+                    'token_budget' => 12_000,
+                    'include_docs' => true,
+                    'include_skills' => false,
+                ],
+            );
+        } catch (Throwable $exception) {
+            [$message] = Redactor::string($exception->getMessage());
+
+            return [
+                'requires_followup' => false,
+                'new_affected_paths' => [],
+                'new_affected_symbols' => [],
+                'reason' => 'Post-apply impact inspection was unavailable: ' . Text::truncate($message, 300),
+                'related_regions' => [],
+                'depth' => $depth,
+                'max_depth' => 2,
+                'budget_exhausted' => $depth >= 2,
+                'status' => 'unavailable',
+                'next_state_when_required' => 'IMPACT_EXPANSION',
+            ];
+        }
+
+        $newPaths = [];
+        $newSymbols = [];
+        foreach (is_array($bundle['impacts'] ?? null) ? $bundle['impacts'] : [] as $impact) {
+            if (!is_array($impact)) {
+                continue;
+            }
+            $symbolHasNewConsumer = false;
+            foreach (self::strings($impact['upstream_files'] ?? []) as $path) {
+                if (isset($knownPaths[$path])) {
+                    continue;
+                }
+                $newPaths[$path] = true;
+                $symbolHasNewConsumer = true;
+            }
+            $symbol = trim((string) ($impact['symbol'] ?? ''));
+            if ($symbolHasNewConsumer && $symbol !== '') {
+                $newSymbols[$symbol] = true;
+            }
+        }
+        $relatedRegions = [];
+        foreach (is_array($bundle['regions'] ?? null) ? $bundle['regions'] : [] as $region) {
+            if (!is_array($region) || !isset($newPaths[(string) ($region['path'] ?? '')])) {
+                continue;
+            }
+            $relatedRegions[] = [
+                'path' => (string) ($region['path'] ?? ''),
+                'start_line' => (int) ($region['start_line'] ?? 0),
+                'end_line' => (int) ($region['end_line'] ?? 0),
+                'symbol_uid' => (string) ($region['symbol_uid'] ?? ''),
+                'target_ref' => (string) ($region['target_ref'] ?? ''),
+                'expected_file_sha256' => (string) ($region['expected_file_sha256'] ?? ''),
+                'expected_digest' => (string) ($region['expected_digest'] ?? ''),
+            ];
+            if (count($relatedRegions) >= 20) {
+                break;
+            }
+        }
+
+        $hasExpansion = $newPaths !== [];
+        $budgetExhausted = $depth >= 2;
+
+        return [
+            'requires_followup' => $hasExpansion && !$budgetExhausted,
+            'new_affected_paths' => array_keys($newPaths),
+            'new_affected_symbols' => array_keys($newSymbols),
+            'reason' => $hasExpansion
+                ? ($budgetExhausted
+                    ? 'New indexed consumers were found, but the impact expansion depth is exhausted.'
+                    : 'The refreshed index found consumers outside the submitted TaskContract paths.')
+                : 'The refreshed index found no consumers outside the submitted TaskContract paths.',
+            'related_regions' => $relatedRegions,
+            'depth' => $depth,
+            'max_depth' => 2,
+            'budget_exhausted' => $budgetExhausted,
+            'status' => 'complete',
+            'next_state_when_required' => 'IMPACT_EXPANSION',
+        ];
     }
 
     /** @param array<string, mixed> $draft */
@@ -970,6 +1503,47 @@ final class IntelligenceService
             $result['interrupted_edit_recovery'] = $recovery;
             $result['knowledge_state'] = $this->reconcileKnowledge($index, $this->editResultPaths($result));
             return $result;
+        });
+    }
+
+    /** @param array<string, mixed> $input */
+    private function getRunStatus(array $input): array
+    {
+        $runId = self::required($input, 'run_id');
+
+        return $this->withProject($input, false, function (ProjectIndex $index) use ($runId): array {
+            return [
+                'request_id' => Ids::make('req'),
+                'project_id' => $index->projectId(),
+                'repository' => $index->root(),
+                'execution_run' => (new ExecutionRunService($this->learningStore, $this->config))
+                    ->status($index->projectId(), $runId),
+            ];
+        });
+    }
+
+    /** @param array<string, mixed> $input */
+    private function getRunTrace(array $input): array
+    {
+        $runId = self::required($input, 'run_id');
+
+        return $this->withProject($input, false, function (ProjectIndex $index) use ($input, $runId): array {
+            $trace = (new ExecutionRunService($this->learningStore, $this->config))->trace(
+                $index->projectId(),
+                $runId,
+                [
+                    'after_sequence' => max(0, (int) ($input['after_sequence'] ?? 0)),
+                    'limit' => max(1, min(200, (int) ($input['limit'] ?? 100))),
+                    'include_files' => (bool) ($input['include_files'] ?? true),
+                    'include_diffs' => (bool) ($input['include_diffs'] ?? false),
+                    'path' => trim((string) ($input['path'] ?? '')),
+                ],
+            );
+            $trace['request_id'] = Ids::make('req');
+            $trace['project_id'] = $index->projectId();
+            $trace['repository'] = $index->root();
+
+            return $trace;
         });
     }
 
@@ -1123,10 +1697,24 @@ final class IntelligenceService
     private function withProject(array $input, bool $refresh, callable $callback): array
     {
         $repository = trim((string) ($input['repository'] ?? ''));
+        $repositorySource = 'argument';
         if ($repository === '') {
-            throw new ToolException('VALIDATION_FAILED', 'repository is required');
+            $repository = $this->inferRepositoryFromKnownPaths($input) ?? '';
+            $repositorySource = 'process_cwd_validated_by_paths';
+        }
+        if ($repository === '') {
+            throw new ToolException(
+                'REPOSITORY_REQUIRED',
+                'repository is required unless every known path exists safely under the current project directory',
+                false,
+                [
+                    'repository_inference_attempted' => true,
+                    'known_path_count' => count(self::strings($input['paths'] ?? [])),
+                ],
+            );
         }
         $resolved = ProjectResolver::resolve($repository, false);
+        $resolved['repository_source'] = $repositorySource;
         $requestedProject = trim((string) ($input['project_id'] ?? ''));
         $actualProject = (string) $resolved['project']['id'];
         if ($requestedProject !== '' && $requestedProject !== $actualProject) {
@@ -1150,6 +1738,38 @@ final class IntelligenceService
         }
 
         return $callback($index, $resolved);
+    }
+
+    /** @param array<string,mixed> $input */
+    private function inferRepositoryFromKnownPaths(array $input): ?string
+    {
+        $paths = self::strings($input['paths'] ?? []);
+        $cwd = getcwd();
+        $root = is_string($cwd) ? realpath($cwd) : false;
+        if ($paths === [] || $root === false || !is_dir($root)) {
+            return null;
+        }
+        $rootPrefix = rtrim($root, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR;
+        foreach ($paths as $path) {
+            $path = str_replace('\\', '/', trim($path));
+            if ($path === ''
+                || str_starts_with($path, '/')
+                || preg_match('~^[A-Za-z]:/~', $path) === 1
+                || in_array('..', explode('/', $path), true)) {
+                return null;
+            }
+            $absolute = realpath($rootPrefix . str_replace('/', DIRECTORY_SEPARATOR, $path));
+            if ($absolute === false || !is_file($absolute)) {
+                return null;
+            }
+            $normalizedRoot = strtolower($rootPrefix);
+            $normalizedAbsolute = strtolower($absolute);
+            if (!str_starts_with($normalizedAbsolute, $normalizedRoot)) {
+                return null;
+            }
+        }
+
+        return $root;
     }
 
     private function refreshIfNeeded(ProjectIndex $index): void

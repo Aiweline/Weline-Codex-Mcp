@@ -58,11 +58,11 @@ SessionStart 自动上下文不会注入源码、模块文档、索引 Chunk 或
 
 所有检索和写操作都校验 `project_id`。同时提供 Repository 与 Project ID 时，两者必须匹配。v1 不提供跨项目自动召回，也不开放网络 MCP 传输。
 
-Project Index 进一步使用 canonical Git root 和独立数据库目录。读取路径经过 normalization、realpath containment 和 symlink escape 检查；写入路径只接受 repository-relative path，并重新逐组件检查。索引中的行号和路径只是定位提示，写入权威始终是 apply 时重新读取的文件 Hash。
+Project Index 使用调用方给出的规范化绝对目录作为唯一边界和独立数据库目录；不会向上信任或合并 Git root。读取路径经过 normalization、realpath containment 和 symlink escape 检查；写入路径只接受 repository-relative path，并重新逐组件检查。索引中的行号和路径只是定位提示，写入权威始终是 apply 时重新读取的文件 Hash。
 
 ## Indexing boundaries
 
-- 文件发现使用 Git file list，不在检索请求中递归遍历目录。
+- 文件发现使用项目根下的受限文件系统目录，并在进入子目录前排除第三方、生成物、测试、密钥和配置排除路径；检索请求只查询持久索引。
 - 默认排除 `.git`、索引数据库、第三方依赖、生成目录、静态构建产物、`view/tpl`、minified/source map、测试、大文件、二进制和常见密钥文件。
 - 初次索引必须读取符合规则的本地文件；不能把“AI 不扫描”误写成“系统永不扫描”。
 - 符合规则的代码、文档和 Skill 完整文本会 gzip 压缩后保存在对应项目的 `project.sqlite`。`get_edit_bundle` 从 Chunk/内容/符号表一次组装精确区域，不逐个读取工作区；兼容 `get_indexed_files` 仍可在 full profile 中批量读取，因此项目数据库按源代码同等敏感度保护。
